@@ -207,3 +207,24 @@ CORR_FULL = 0.40                  # |inverse corr| at which the layer gets full 
 CORR_BLEND_LONG = 0.6             # weight of the 20-day corr vs 5-day
 MACRO_STALE_MIN = 60              # drop an input whose last bar is this much older than gold
 MACRO_BIAS_FRAC = 0.30            # |score| ≥ this × max → LONG/SHORT
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 3 — Layer 3 cross-asset agreement (±20)
+# ═════════════════════════════════════════════════════════════════════════════
+XASSET_MAX = 20
+IMPLIED_TRAIN_DAYS = 20            # regression window (prior trading days)
+IMPLIED_MIN_TRAIN = 300            # bars needed to fit
+IMPLIED_MIN_WINDOW = 16            # bars scored: today's bars, at least this many
+RESID_Z_FULL = 2.0                 # residual z that earns the full residual points
+XASSET_PTS = {"Residual": 8, "Structural": 5, "Silver": 4, "Metals context": 3}
+
+STRUCT_YIELD_BP = 2.0              # yields up at least this much on the day …
+STRUCT_DXY_PCT = 0.10              # … and dollar up at least this much …
+STRUCT_GOLD_PCT = 0.15             # … while gold is up at least this much = structural bid
+
+SILVER_HIGH_TOL_ATR = 0.50         # gold within this of its session high = "at the high"
+SILVER_LAG_PCT = 0.30              # silver this far below its own session high = not confirming
+NEW_EXTREME_BARS = 4               # gold's high must be set within the last N bars
+
+OIL_SPIKE_PCT = 3.0                # G8: oil ±3% on the day

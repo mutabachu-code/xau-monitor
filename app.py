@@ -2,6 +2,7 @@
 XAU Monitor — gold (XAUUSD) intraday dashboard.
 Phase 0: data, session clock, chart.  Phase 1: L5 technicals, L6 liquidity.
 Phase 2: L1 rates, L2 dollar (correlation-weighted).
+Phase 3: L3 cross-asset agreement (implied move, structural bid, silver, metals).
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
 futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
@@ -18,6 +19,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 import xau_config as cfg
+import xau_crossasset as xc
 import xau_data as xd
 import xau_dollar as xdl
 import xau_liquidity as xl
@@ -71,6 +73,7 @@ liq = xl.get_liq_report(gold)
 fred = xr.load_fred()
 rates = xr.get_rates_report(bundle, fred)
 dollar = xdl.get_dollar_report(bundle)
+xasset = xc.get_xasset_report(bundle)
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -144,7 +147,7 @@ def render_cross():
         col.metric(name, fmt(ch["last"], 3 if t in ("JPY=X",) or t in cfg.YIELD_TICKERS else 2),
                    delta)
     st.caption("Change vs previous CME trading-day close. DXY, yields and USD/JPY feed "
-               "L1/L2 below; Phase 3 adds the cross-asset agreement score.")
+               "L1/L2 below; silver, copper and oil feed L3.")
 
 
 panel("Cross-asset", render_cross)
@@ -396,6 +399,77 @@ def render_macro_readings():
                    "on intraday Treasury futures only.")
 
 
+# ── L3 cross-asset agreement ─────────────────────────────────────────────────
+FLAG_TEXT = {
+    "structural_bid": "Structural bid (G7)",
+    "structural_offer": "Structural offer",
+    "silver_nonconfirm_high": "Silver not confirming high (G3)",
+    "silver_nonconfirm_low": "Silver not confirming low",
+    "oil_spike_up": "Oil spike up (G8)",
+    "oil_spike_down": "Oil spike down",
+}
+
+
+def render_xasset():
+    st.subheader("L3 · Cross-asset agreement")
+    if not xasset.ok:
+        st.info(f"Cross-asset layer unavailable: {xasset.error}")
+        return
+    imp = xasset.implied
+    c = st.columns(4)
+    c[0].metric(f"Score (±{cfg.XASSET_MAX})", f"{xasset.score:+.1f}",
+                _bias_badge(xasset.bias), delta_color="off")
+    c[1].metric("Residual z", "—" if not imp else f"{imp['resid_z']:+.1f}",
+                None if not imp else f"gap {imp['resid_pct']:+.2f}%",
+                delta_color="off")
+    c[2].metric("Move type", xasset.move_type)
+    c[3].metric("Gold/silver ratio", "—" if xasset.gs_ratio is None else f"{xasset.gs_ratio:.1f}",
+                None if xasset.gs_ratio_chg is None else f"{xasset.gs_ratio_chg:+.2f}% today",
+                delta_color="off")
+    pts = {"Residual": 8, "Structural": 5, "Silver": 4, "Metals context": 3}
+    rows = [{"Component": k, "Points": v, "Max": pts[k], "Reading": xasset.details.get(k, "")}
+            for k, v in xasset.components.items()]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    on = [FLAG_TEXT[k] for k, v in xasset.flags.items() if v and k in FLAG_TEXT]
+    if on:
+        st.write("**Flags for the master signal:** " + " · ".join(on))
+    for n in xasset.notes:
+        st.write("•", n)
+
+
+def render_implied_chart():
+    imp = xasset.implied if xasset.ok else None
+    if not imp:
+        st.caption("Implied-move chart appears once there are 20 days of overlapping "
+                   "driver data.")
+        return
+    path = imp["path"]
+    x = path.index.tz_convert(cfg.DISPLAY_TZ).tz_localize(None)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=path["actual"], mode="lines", name="Gold actual",
+                             line=dict(color="#2a78d6", width=2),
+                             hovertemplate="%{x|%a %H:%M}<br>actual %{y:+.2f}%<extra></extra>"))
+    fig.add_trace(go.Scatter(x=x, y=path["implied"], mode="lines",
+                             name="Implied by yields · USD · oil",
+                             line=dict(color="#eb6834", width=2, dash="dash"),
+                             hovertemplate="%{x|%a %H:%M}<br>implied %{y:+.2f}%<extra></extra>"))
+    fig.add_hline(y=0, line_width=1, line_color="rgba(128,128,128,0.5)")
+    fig.update_layout(height=300, margin=dict(l=10, r=20, t=40, b=30),
+                      title=f"Gold vs what its drivers imply (last {imp['bars']} bars, "
+                            "cumulative %)", title_font_size=13, hovermode="x unified",
+                      legend=dict(orientation="h", y=-0.2, x=0),
+                      yaxis=dict(title="% move", gridcolor="rgba(128,128,128,0.15)",
+                                 ticksuffix="%"),
+                      xaxis=dict(showgrid=False))
+    st.plotly_chart(fig, width="stretch")
+    m = xasset.model
+    contrib = " · ".join(f"{k.replace('_bp', '').replace('dxy', 'USD')} "
+                         f"{v:+.2f}%" for k, v in imp["contrib"].items())
+    st.caption(f"Gap between the lines = residual. Driver contributions: {contrib}. "
+               f"Model fit on {m['n']} bars from the prior {cfg.IMPLIED_TRAIN_DAYS} "
+               f"trading days, R² {m['r2']:.2f}.")
+
+
 # ── Layer panels ─────────────────────────────────────────────────────────────
 def _bias_badge(bias):
     return {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT"}.get(bias, "⚪ NEUTRAL")
@@ -474,6 +548,13 @@ with mcol2:
     panel("Dollar", render_macro, dollar, "L2 · Dollar")
 panel("Macro readings", render_macro_readings)
 panel("Link strength", render_link_chart)
+
+st.divider()
+xcol1, xcol2 = st.columns([1, 1])
+with xcol1:
+    panel("Cross-asset", render_xasset)
+with xcol2:
+    panel("Implied move", render_implied_chart)
 
 st.divider()
 lcol, rcol = st.columns(2)
