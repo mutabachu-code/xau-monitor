@@ -3,6 +3,7 @@ XAU Monitor — gold (XAUUSD) intraday dashboard.
 Phase 0: data, session clock, chart.  Phase 1: L5 technicals, L6 liquidity.
 Phase 2: L1 rates, L2 dollar (correlation-weighted).
 Phase 3: L3 cross-asset agreement (implied move, structural bid, silver, metals).
+Phase 4: L8 regime classifier (which driver is in control, trade style).
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
 futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
@@ -24,8 +25,22 @@ import xau_data as xd
 import xau_dollar as xdl
 import xau_liquidity as xl
 import xau_rates as xr
+import xau_regime as xg
 import xau_sessions as xs
 import xau_technicals as xt
+import xau_macro as xm
+import xau_runtime as xrt
+
+# Reload project modules if a git push changed them (Streamlit Cloud can keep
+# stale copies in memory), dependency order: config first, app-level last.
+_reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg])
+REQUIRED_CONFIG_VERSION = 4
+if getattr(cfg, "CONFIG_VERSION", 0) < REQUIRED_CONFIG_VERSION:
+    st.error(f"xau_config.py on the server is older than app.py expects "
+             f"(version {getattr(cfg, 'CONFIG_VERSION', 'none')} < "
+             f"{REQUIRED_CONFIG_VERSION}). Push the latest xau_config.py, then "
+             "Manage app → Reboot.")
+    st.stop()
 
 
 def panel(name, fn, *args, **kwargs):
@@ -74,6 +89,7 @@ fred = xr.load_fred()
 rates = xr.get_rates_report(bundle, fred)
 dollar = xdl.get_dollar_report(bundle)
 xasset = xc.get_xasset_report(bundle)
+regime = xg.get_regime_report(bundle, tech, rates, dollar, xasset)
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -99,6 +115,7 @@ def render_header():
 
 
 panel("Header", render_header)
+regime_slot = st.empty()          # filled once the regime helpers are defined
 
 
 # ── Price metrics ────────────────────────────────────────────────────────────
@@ -470,6 +487,67 @@ def render_implied_chart():
                f"trading days, R² {m['r2']:.2f}.")
 
 
+# ── L8 regime ────────────────────────────────────────────────────────────────
+REGIME_ICON = {"rates-led": "🏦", "flow-led": "🌊", "risk-off": "🚨", "trend": "📈",
+               "chop": "↔️", "mixed": "❔"}
+
+
+def render_regime_banner():
+    if not regime.ok:
+        return
+    txt = (f"**{REGIME_ICON.get(regime.regime, '')} Regime: {regime.label}** · "
+           f"strength {regime.strength:.0%} · style: *{regime.style}* · "
+           f"L8 {regime.score:+.1f}/{cfg.REGIME_MAX}  \n{regime.playbook}")
+    box = {"risk-off": st.error, "chop": st.warning, "mixed": st.warning}.get(
+        regime.regime, st.info)
+    box(txt)
+
+
+def render_regime():
+    st.subheader("L8 · Regime")
+    if not regime.ok:
+        st.info(f"Regime unavailable: {regime.error}")
+        return
+    c = st.columns(4)
+    c[0].metric(f"Score (±{cfg.REGIME_MAX})", f"{regime.score:+.1f}",
+                _bias_badge(regime.bias), delta_color="off")
+    ranked = sorted(regime.candidates.items(), key=lambda kv: -kv[1])
+    ru = ranked[1] if len(ranked) > 1 else None
+    c[1].metric("Runner-up", "—" if not ru else f"{ru[1]:.0%}",
+                None if not ru else ru[0], delta_color="off")
+    c[2].metric("Strength", f"{regime.strength:.0%}")
+    c[3].metric("Direction", f"{regime.direction:+.2f}")
+    rows = [{"Candidate": cfg.REGIME_LABELS[k], "Strength": v, "Why": regime.why.get(k, "")}
+            for k, v in sorted(regime.candidates.items(), key=lambda kv: -kv[1])]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    for n in regime.notes:
+        st.write("•", n)
+
+
+def render_regime_chart():
+    if not regime.ok or not regime.candidates:
+        return
+    items = sorted(regime.candidates.items(), key=lambda kv: kv[1])
+    names = [cfg.REGIME_LABELS[k] for k, _ in items]
+    vals = [v for _, v in items]
+    colors = ["#2a78d6" if k == regime.regime else "rgba(128,128,128,0.45)"
+              for k, _ in items]
+    fig = go.Figure(go.Bar(x=vals, y=names, orientation="h", marker_color=colors,
+                           text=[f"{v:.0%}" for v in vals], textposition="outside",
+                           hovertemplate="%{y}: %{x:.0%}<extra></extra>"))
+    fig.add_vline(x=cfg.REGIME_MIN_STRENGTH, line_dash="dash", line_width=1,
+                  line_color="rgba(128,128,128,0.7)",
+                  annotation_text=f"min {cfg.REGIME_MIN_STRENGTH:.0%}",
+                  annotation_position="top", annotation_font_size=10)
+    fig.update_layout(height=260, margin=dict(l=10, r=40, t=40, b=20),
+                      title="Which driver is in control (candidate strength)",
+                      title_font_size=13, showlegend=False,
+                      xaxis=dict(range=[0, 1.15], tickformat=".0%",
+                                 gridcolor="rgba(128,128,128,0.15)"),
+                      yaxis=dict(showgrid=False), bargap=0.35)
+    st.plotly_chart(fig, width="stretch")
+
+
 # ── Layer panels ─────────────────────────────────────────────────────────────
 def _bias_badge(bias):
     return {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT"}.get(bias, "⚪ NEUTRAL")
@@ -555,6 +633,15 @@ with xcol1:
     panel("Cross-asset", render_xasset)
 with xcol2:
     panel("Implied move", render_implied_chart)
+
+st.divider()
+gcol1, gcol2 = st.columns([1, 1])
+with gcol1:
+    panel("Regime", render_regime)
+with gcol2:
+    panel("Regime chart", render_regime_chart)
+with regime_slot.container():
+    panel("Regime banner", render_regime_banner)
 
 st.divider()
 lcol, rcol = st.columns(2)

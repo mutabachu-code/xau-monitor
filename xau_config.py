@@ -11,6 +11,9 @@ Decisions (2026-09-26):
   - Forward-test target: >75% win rate over 60 days
 """
 from dataclasses import dataclass
+
+# Bumped whenever a phase adds settings; app.py refuses to run on an older copy.
+CONFIG_VERSION = 4
 from datetime import time
 from typing import Optional, Tuple
 
@@ -170,6 +173,8 @@ EXTRA_TICKERS = {
     "ZT=F": "2y T-Note fut",
     "^FVX": "US 5y",
     "EURUSD=X": "EUR/USD",
+    "ES=F": "S&P 500 fut",        # Phase 4: risk-off detection
+    "^VIX": "VIX",
 }
 # Approximate modified duration used to turn futures % moves into yield bp
 FUT_DURATION = {"ZN=F": 6.5, "ZT=F": 1.9}
@@ -228,3 +233,52 @@ SILVER_LAG_PCT = 0.30              # silver this far below its own session high 
 NEW_EXTREME_BARS = 4               # gold's high must be set within the last N bars
 
 OIL_SPIKE_PCT = 3.0                # G8: oil ±3% on the day
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 4 — Layer 8 regime classifier (±15)
+# ═════════════════════════════════════════════════════════════════════════════
+REGIME_MAX = 15
+REGIME_MIN_STRENGTH = 0.35          # below this for every candidate → "mixed"
+RATES_LED_ACTIVE_RAW = 0.5          # |raw| L1/L2 signal that counts as fully active macro
+
+# risk-off: equities down AND volatility up
+RISKOFF_ES_PCT = -1.0               # ES day % that counts as a full-strength sell-off
+RISKOFF_VIX_CHG_PCT = 15.0          # VIX day % rise for full strength
+RISKOFF_VIX_LEVEL = 25.0            # or VIX at/above this level
+RISKOFF_HAVEN_GOLD_PCT = 0.10       # gold up this much during risk-off = haven bid
+
+# technical trend
+TREND_ADX_START = 20                # ADX where trend strength starts
+TREND_ADX_FULL = 40                 # ADX for full trend strength
+
+REGIME_LABELS = {
+    "rates-led": "Rates/dollar-led",
+    "flow-led": "Flow-led (decoupled)",
+    "risk-off": "Risk-off",
+    "trend": "Technical trend",
+    "chop": "Chop",
+    "mixed": "Mixed / no clear driver",
+}
+REGIME_STYLE = {           # what the master signal should favour
+    "rates-led": "trend-follow",
+    "flow-led": "buy-dips / sell-rips with the flow",
+    "risk-off": "event-driven, reduced size",
+    "trend": "trend-follow",
+    "chop": "mean-revert",
+    "mixed": "selective, reduced size",
+}
+REGIME_PLAYBOOK = {
+    "rates-led": "Trade with the yields/dollar read. Watch 2y spikes and US data; "
+                 "fade gold moves that fight the macro tape.",
+    "flow-led": "Macro headwinds matter less — the bid/offer is gold's own flow. "
+                "Lean on L3 residual, VWAP pullbacks and structure.",
+    "risk-off": "Two sub-cases: haven bid (gold up with equities down) favours "
+                "longs; liquidation (gold sold with equities) favours patience — "
+                "wait for the flush to end.",
+    "trend": "No macro driver dominates but price is trending. Follow structure, "
+             "buy/sell pullbacks to EMA21 or VWAP.",
+    "chop": "Range day. Mean-revert between VWAP bands, CPR and liquidity levels; "
+            "no breakout entries.",
+    "mixed": "Drivers disagree. Only take A-grade setups with multi-layer agreement.",
+}
