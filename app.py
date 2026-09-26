@@ -4,6 +4,7 @@ Phase 0: data, session clock, chart.  Phase 1: L5 technicals, L6 liquidity.
 Phase 2: L1 rates, L2 dollar (correlation-weighted).
 Phase 3: L3 cross-asset agreement (implied move, structural bid, silver, metals).
 Phase 4: L8 regime classifier (which driver is in control, trade style).
+Phase 5: L4 flows/positioning (ETF, COT), L7 options/vol (GLD walls, skew, GVZ).
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
 futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
@@ -25,7 +26,8 @@ import os as _os
 _APP_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _REQUIRED_FILES = ["xau_config.py", "xau_sessions.py", "xau_data.py", "xau_technicals.py",
                    "xau_liquidity.py", "xau_macro.py", "xau_rates.py", "xau_dollar.py",
-                   "xau_crossasset.py", "xau_regime.py", "xau_runtime.py"]
+                   "xau_crossasset.py", "xau_regime.py", "xau_runtime.py",
+                   "xau_flows.py", "xau_options.py"]
 _missing = [f for f in _REQUIRED_FILES if not _os.path.exists(_os.path.join(_APP_DIR, f))]
 if _missing:
     st.error("**Missing from the repo:** " + ", ".join(f"`{f}`" for f in _missing) +
@@ -37,6 +39,8 @@ import xau_config as cfg
 import xau_crossasset as xc
 import xau_data as xd
 import xau_dollar as xdl
+import xau_flows as xf
+import xau_options as xo
 import xau_liquidity as xl
 import xau_rates as xr
 import xau_regime as xg
@@ -47,8 +51,8 @@ import xau_runtime as xrt
 
 # Reload project modules if a git push changed them (Streamlit Cloud can keep
 # stale copies in memory), dependency order: config first, app-level last.
-_reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg])
-REQUIRED_CONFIG_VERSION = 4
+_reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo])
+REQUIRED_CONFIG_VERSION = 5
 if getattr(cfg, "CONFIG_VERSION", 0) < REQUIRED_CONFIG_VERSION:
     st.error(f"xau_config.py on the server is older than app.py expects "
              f"(version {getattr(cfg, 'CONFIG_VERSION', 'none')} < "
@@ -87,6 +91,7 @@ with st.sidebar:
     show_cpr = st.checkbox("CPR + R1/S1", value=True)
     show_sweeps = st.checkbox("Liquidity sweeps", value=True)
     show_rsi = st.checkbox("RSI pane", value=True)
+    show_walls = st.checkbox("Option walls (GLD → GC=F)", value=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
     st.caption(f"Signal timeframe {cfg.SIGNAL_INTERVAL} · cache {cfg.CACHE_TTL_SEC}s · "
@@ -104,6 +109,8 @@ rates = xr.get_rates_report(bundle, fred)
 dollar = xdl.get_dollar_report(bundle)
 xasset = xc.get_xasset_report(bundle)
 regime = xg.get_regime_report(bundle, tech, rates, dollar, xasset)
+flows = xf.get_flow_report()
+opts = xo.get_options_report(gold, bundle["cross"].get("^GVZ"))
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -299,6 +306,11 @@ def render_chart():
     if pdl:
         seg(pdl["high"], "PDH", "#e67e22", "dash")
         seg(pdl["low"], "PDL", "#e67e22", "dash")
+    if show_walls and opts.ok:
+        if opts.call_wall:
+            seg(opts.call_wall, "Call wall", "#c0392b", "longdash", 1.5)
+        if opts.put_wall:
+            seg(opts.put_wall, "Put wall", "#27ae60", "longdash", 1.5)
     if liq.ok:
         for lv in liq.levels:
             if lv.name in ("EQH", "EQL", "PWH", "PWL"):
@@ -562,6 +574,106 @@ def render_regime_chart():
     st.plotly_chart(fig, width="stretch")
 
 
+# ── L4 flows / L7 options ───────────────────────────────────────────────────
+def _layer_table(rep, pts):
+    rows = [{"Component": k, "Points": v, "Max": pts[k], "Reading": rep.details.get(k, "")}
+            for k, v in rep.components.items()]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def render_flows():
+    st.subheader("L4 · Flows & positioning")
+    if not flows.ok:
+        st.info(f"Flows unavailable: {flows.error}. CFTC and ETF data come from "
+                "publicreporting.cftc.gov and Yahoo daily bars.")
+        return
+    c = st.columns(4)
+    c[0].metric(f"Score (±{cfg.FLOWS_MAX})", f"{flows.score:+.1f}", _bias_badge(flows.bias),
+                delta_color="off")
+    cs = flows.cot
+    c[1].metric("MM net long", "—" if not cs else f"{cs['net'] / 1000:,.0f}k",
+                None if not cs else f"{cs['week_chg'] / 1000:+,.1f}k w/w", delta_color="off")
+    c[2].metric("3y percentile", "—" if not cs or cs["percentile"] is None
+                else f"{cs['percentile']:.0f}th")
+    c[3].metric("ETF source", "shares" if flows.etf_source.startswith("GLD shares")
+                else "proxy" if flows.etf_source else "—")
+    _layer_table(flows, cfg.FLOW_PTS)
+    for n in flows.notes:
+        st.write("•", n)
+
+
+def render_cot_chart():
+    h = flows.cot_history if flows.ok else None
+    if h is None or len(h) < 10:
+        return
+    h = h.iloc[-cfg.COT_PCT_WEEKS:]
+    fig = go.Figure(go.Scatter(x=h.index, y=h["net"] / 1000, mode="lines",
+                               line=dict(color="#2a78d6", width=2), name="Managed money net",
+                               hovertemplate="%{x|%d %b %Y}: %{y:,.0f}k<extra></extra>"))
+    hi = h["net"].quantile(cfg.COT_CROWDED_PCT / 100) / 1000
+    lo = h["net"].quantile(cfg.COT_WASHED_PCT / 100) / 1000
+    for y, txt, pos in ((hi, f"crowded ({cfg.COT_CROWDED_PCT}th)", "top left"),
+                        (lo, f"washed out ({cfg.COT_WASHED_PCT}th)", "bottom right")):
+        fig.add_hline(y=y, line_dash="dash", line_width=1, line_color="rgba(128,128,128,0.7)",
+                      annotation_text=txt, annotation_position=pos,
+                      annotation_font_size=10)
+    fig.update_layout(height=250, margin=dict(l=10, r=20, t=36, b=20), showlegend=False,
+                      title="COMEX gold — managed money net position (thousand contracts)",
+                      title_font_size=13, yaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
+                      xaxis=dict(showgrid=False))
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_options():
+    st.subheader("L7 · Options & volatility")
+    if not opts.ok:
+        st.info(f"Options/vol unavailable: {opts.error}")
+        return
+    c = st.columns(4)
+    c[0].metric(f"Score (±{cfg.OPTIONS_MAX})", f"{opts.score:+.1f}", _bias_badge(opts.bias),
+                delta_color="off")
+    c[1].metric("Daily exp. move", "—" if opts.em_daily is None else f"${opts.em_daily:,.0f}",
+                None if opts.em_used is None else f"{opts.em_used:.0%} used", delta_color="off")
+    c[2].metric("Dealer gamma", "—" if opts.gex is None else
+                ("long" if opts.gex > 0 else "short"),
+                None if opts.gex is None else ("dampens moves" if opts.gex > 0 else
+                                               "amplifies moves"), delta_color="off")
+    c[3].metric("GVZ", "—" if opts.gvz is None else f"{opts.gvz:.1f}",
+                None if opts.gvz_day_pct is None else f"{opts.gvz_day_pct:+.1f}%",
+                delta_color="off")
+    _layer_table(opts, cfg.OPT_PTS)
+    st.caption("GLD options scaled to GC=F by the live price ratio"
+               + ("" if opts.ratio is None else f" ({opts.ratio:.2f}×)")
+               + ". Most gold options trade on COMEX, so treat walls as approximate.")
+    for n in opts.notes:
+        st.write("•", n)
+
+
+def render_oi_chart():
+    t = opts.strikes if opts.ok else None
+    if t is None or t.empty:
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=t["strike_gold"], y=t["call_oi"], name="Call OI",
+                         marker_color="#2a78d6",
+                         hovertemplate="%{x:,.0f}: %{y:,.0f} calls<extra></extra>"))
+    fig.add_trace(go.Bar(x=t["strike_gold"], y=-t["put_oi"], name="Put OI",
+                         marker_color="#eb6834",
+                         hovertemplate="%{x:,.0f}: %{customdata:,.0f} puts<extra></extra>",
+                         customdata=t["put_oi"]))
+    last = float(gold["Close"].iat[-1])
+    fig.add_vline(x=last, line_width=1.5, line_color="rgba(128,128,128,0.9)",
+                  annotation_text="price", annotation_position="top",
+                  annotation_font_size=10)
+    fig.update_layout(height=250, margin=dict(l=10, r=20, t=36, b=20), barmode="relative",
+                      bargap=0.15, title="GLD open interest by strike (GC=F terms) — "
+                      "calls up, puts down", title_font_size=13,
+                      legend=dict(orientation="h", y=-0.25, x=0),
+                      yaxis=dict(gridcolor="rgba(128,128,128,0.15)", title="contracts"),
+                      xaxis=dict(showgrid=False))
+    st.plotly_chart(fig, width="stretch")
+
+
 # ── Layer panels ─────────────────────────────────────────────────────────────
 def _bias_badge(bias):
     return {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT"}.get(bias, "⚪ NEUTRAL")
@@ -654,6 +766,14 @@ with gcol1:
     panel("Regime", render_regime)
 with gcol2:
     panel("Regime chart", render_regime_chart)
+st.divider()
+fcol1, fcol2 = st.columns(2)
+with fcol1:
+    panel("Flows", render_flows)
+    panel("COT chart", render_cot_chart)
+with fcol2:
+    panel("Options", render_options)
+    panel("OI chart", render_oi_chart)
 with regime_slot.container():
     panel("Regime banner", render_regime_banner)
 

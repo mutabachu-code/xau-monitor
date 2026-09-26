@@ -13,7 +13,7 @@ Decisions (2026-09-26):
 from dataclasses import dataclass
 
 # Bumped whenever a phase adds settings; app.py refuses to run on an older copy.
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 from datetime import time
 from typing import Optional, Tuple
 
@@ -282,3 +282,46 @@ REGIME_PLAYBOOK = {
             "no breakout entries.",
     "mixed": "Drivers disagree. Only take A-grade setups with multi-layer agreement.",
 }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 5 — Layer 4 flows/positioning (±10) and Layer 7 options/vol (±10)
+# ═════════════════════════════════════════════════════════════════════════════
+FLOWS_MAX = 10
+OPTIONS_MAX = 10
+
+# CFTC disaggregated futures-only, COMEX gold (Socrata JSON, no key needed)
+COT_URL = ("https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
+           "?cftc_contract_market_code=088691"
+           "&$order=report_date_as_yyyy_mm_dd%20DESC&$limit=170")
+COT_TTL_SEC = 6 * 3600
+COT_TIMEOUT = 10
+COT_PCT_WEEKS = 156                   # 3-year percentile window
+COT_CROWDED_PCT = 90                  # G4: net long above this percentile = crowded
+COT_WASHED_PCT = 10
+COT_REF_WEEK_CHG_OI = 2.0             # net change (% of OI) for full trend points
+FLOW_PTS = {"ETF flow": 5, "COT trend": 3, "COT crowding": 2}
+
+ETF_TICKERS = ["GLD", "IAU"]
+ETF_DAILY_PERIOD = "1y"
+ETF_TTL_SEC = 3600
+ETF_FLOW_DAYS = 5
+ETF_REF_SHARES_PCT = 0.5              # 5-day shares-outstanding change for full points
+ETF_REF_PROXY = 0.30                  # signed $-volume / avg $-volume (5d) for full points
+
+# Options (GLD chain, scaled to GC=F by live price ratio)
+OPT_TICKER = "GLD"
+OPT_TTL_SEC = 15 * 60
+OPT_EXPIRIES = 2                      # nearest expiries used for OI / PCR / walls
+OPT_SKEW_MIN_DAYS = 5                 # expiry used for skew must be at least this far
+OPT_WALL_RANGE_PCT = 10.0             # walls searched within ±10% of spot
+OPT_SKEW_OTM_PCT = 5.0                # put ~95% / call ~105% strikes
+OPT_REF_SKEW_VOL = 2.0                # call-minus-put IV (vol pts) for full skew points
+OPT_WALL_NEAR_EM = 0.25               # within 0.25 expected move of a wall = "at" it
+OPT_WALL_MIN_MULT = 1.5               # wall OI must be ≥ this × median strike OI on its side
+OPT_EM_USED_FLAG = 0.95               # today's range ≥ 95% of daily expected move
+OPT_RISK_FREE = 0.04
+OPT_PTS = {"Skew": 3, "Put/call": 2, "Walls": 3, "Vol": 2}
+
+GVZ_DAILY_PERIOD = "1y"
+GVZ_SPIKE_PCT = 5.0                   # GVZ day change that counts as a move
