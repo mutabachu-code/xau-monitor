@@ -13,7 +13,7 @@ Decisions (2026-09-26):
 from dataclasses import dataclass
 
 # Bumped whenever a phase adds settings; app.py refuses to run on an older copy.
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
 from datetime import time
 from typing import Optional, Tuple
 
@@ -395,3 +395,38 @@ ROLLOVER_BLOCK_ET = ("16:45", "18:30")  # around the CME daily break (Mon–Thu)
 WEEKLY_OPEN_BLOCK_MIN = 30              # first 30 min after Sunday 18:00 ET reopen
 FRIDAY_CAUTION_ET = "15:00"             # late Friday: weekend-gap risk
 BLOCK_ON_EM_EXHAUSTED = True            # L7 flag: today's range ≥95% of expected move
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 7 — master signal, conflict rules G1–G10, trade plan, journal
+# ═════════════════════════════════════════════════════════════════════════════
+LAYER_MAX = {"L1": 20, "L2": 15, "L3": 20, "L4": 10, "L5": 25, "L6": 15, "L7": 10, "L8": 15}
+LAYER_NAMES = {"L1": "Rates", "L2": "Dollar", "L3": "Cross-asset", "L4": "Flows",
+               "L5": "Technicals", "L6": "Liquidity", "L7": "Options/vol", "L8": "Regime"}
+MASTER_SCALE = 100 / sum(LAYER_MAX.values())      # ±130 → ±100
+
+TIERS = [(60, "A"), (40, "B"), (25, "C")]          # |score| ≥ → tier; below 25 = none
+TIER_SIZE = {"A": 1.0, "B": 0.75, "C": 0.5}
+AGREE_FRAC = 0.2                                   # layer "agrees" at ≥20% of its max
+AGREE_UPGRADE = 6                                  # G10: ≥6 of 8 agreeing
+G4_EVENT_DAYS = 7                                  # crowded COT into FOMC/CPI within 7 days
+G6_MR_SIGMA = 1.0                                  # chop: only fade from beyond ±1σ VWAP
+G9_GVZ_SPIKE_PCT = 5.0
+CAUTION_SIZE = 0.5
+ATR_SIZE = {"expanding": 0.75, "extreme": 0.5}
+
+# Plan geometry (multiples of 15m ATR)
+ENTRY_ZONE_ATR = 0.3
+STOP_BUFFER_ATR = 0.2
+STOP_MIN_ATR = 1.0
+STOP_MAX_ATR = 3.0
+STOP_DEFAULT_ATR = 1.5
+SWING_LOOKBACK_BARS = 60
+TP1_R, TP2_R = 1.5, 3.0
+TP1_TARGET_R = (1.0, 2.5)                          # use a liquidity level for TP1 in this band
+TARGET_BUFFER_ATR = 0.1
+
+# Forward-test journal
+JOURNAL_CSV = "xau_journal.csv"
+JOURNAL_EXPIRY_BARS = 48                           # 12h of 15m bars, then close at market
+JOURNAL_TP1_PART = 0.5                             # take half at TP1, stop to breakeven

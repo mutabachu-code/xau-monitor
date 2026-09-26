@@ -6,6 +6,7 @@ Phase 3: L3 cross-asset agreement (implied move, structural bid, silver, metals)
 Phase 4: L8 regime classifier (which driver is in control, trade style).
 Phase 5: L4 flows/positioning (ETF, COT), L7 options/vol (GLD walls, skew, GVZ).
 Phase 6: calendar gates (FOMC, CPI, NFP, PPI, PCE, auctions, rollover, weekly open).
+Phase 7: master signal (±100, G1–G10, gates, plan) and forward-test journal.
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
 futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
@@ -28,7 +29,8 @@ _APP_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _REQUIRED_FILES = ["xau_config.py", "xau_sessions.py", "xau_data.py", "xau_technicals.py",
                    "xau_liquidity.py", "xau_macro.py", "xau_rates.py", "xau_dollar.py",
                    "xau_crossasset.py", "xau_regime.py", "xau_runtime.py",
-                   "xau_flows.py", "xau_options.py", "xau_calendar.py"]
+                   "xau_flows.py", "xau_options.py", "xau_calendar.py",
+                   "xau_master_signal.py", "xau_journal.py"]
 _missing = [f for f in _REQUIRED_FILES if not _os.path.exists(_os.path.join(_APP_DIR, f))]
 if _missing:
     st.error("**Missing from the repo:** " + ", ".join(f"`{f}`" for f in _missing) +
@@ -43,7 +45,9 @@ import xau_data as xd
 import xau_dollar as xdl
 import xau_flows as xf
 import xau_options as xo
+import xau_journal as xj
 import xau_liquidity as xl
+import xau_master_signal as xms
 import xau_rates as xr
 import xau_regime as xg
 import xau_sessions as xs
@@ -53,8 +57,9 @@ import xau_runtime as xrt
 
 # Reload project modules if a git push changed them (Streamlit Cloud can keep
 # stale copies in memory), dependency order: config first, app-level last.
-_reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo, xk])
-REQUIRED_CONFIG_VERSION = 6
+_reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo, xk,
+                              xms, xj])
+REQUIRED_CONFIG_VERSION = 7
 if getattr(cfg, "CONFIG_VERSION", 0) < REQUIRED_CONFIG_VERSION:
     st.error(f"xau_config.py on the server is older than app.py expects "
              f"(version {getattr(cfg, 'CONFIG_VERSION', 'none')} < "
@@ -95,6 +100,7 @@ with st.sidebar:
     show_rsi = st.checkbox("RSI pane", value=True)
     show_walls = st.checkbox("Option walls (GLD → GC=F)", value=True)
     show_events = st.checkbox("Economic events", value=True)
+    show_plan = st.checkbox("Trade plan (entry / SL / TP)", value=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
     st.caption(f"Signal timeframe {cfg.SIGNAL_INTERVAL} · cache {cfg.CACHE_TTL_SEC}s · "
@@ -115,6 +121,14 @@ regime = xg.get_regime_report(bundle, tech, rates, dollar, xasset)
 flows = xf.get_flow_report()
 opts = xo.get_options_report(gold, bundle["cross"].get("^GVZ"))
 gate = xk.get_gate_report(now, em_exhausted=bool(opts.flags.get("em_exhausted")))
+LAYERS = {"L1": rates, "L2": dollar, "L3": xasset, "L4": flows,
+          "L5": tech, "L6": liq, "L7": opts, "L8": regime}
+signal = xms.get_master_signal(LAYERS, gold, gate, basis, now)
+if "journal_df" not in st.session_state:
+    st.session_state["journal_df"] = None
+_jdf, _jsaved, _jerr = xj.step(signal, gold, regime.regime if regime.ok else "",
+                               df=st.session_state["journal_df"])
+st.session_state["journal_df"] = _jdf
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -141,6 +155,7 @@ def render_header():
 
 panel("Header", render_header)
 gate_slot = st.empty()            # filled once the gate helpers are defined
+signal_slot = st.empty()          # master signal card
 regime_slot = st.empty()          # filled once the regime helpers are defined
 
 
@@ -326,6 +341,20 @@ def render_chart():
     if pdl:
         seg(pdl["high"], "PDH", "#e67e22", "dash")
         seg(pdl["low"], "PDL", "#e67e22", "dash")
+    if show_plan and signal.ok and signal.plan:
+        pl = signal.plan
+        live = signal.action in ("LONG", "SHORT")
+        dash = "solid" if live else "dot"
+        x_plan0 = x[max(0, len(x) - 24)]
+        for y, txt, col in ((pl["entry"], "Entry", "#7f8c8d"), (pl["sl"], "SL", "#c0392b"),
+                            (pl["tp1"], "TP1", "#27ae60"), (pl["tp2"], "TP2", "#1e8449")):
+            fig.add_shape(type="line", x0=x_plan0, x1=x_end, y0=y, y1=y,
+                          line=dict(color=col, width=1.6 if live else 1, dash=dash),
+                          row=1, col=1)
+            fig.add_annotation(x=x_plan0, y=y, text=f"{txt} {y:,.1f}", showarrow=False,
+                               xanchor="right", font=dict(size=10, color=col),
+                               bgcolor="rgba(255,255,255,0.8)", borderpad=1, row=1, col=1)
+
     if show_walls and opts.ok:
         if opts.call_wall:
             seg(opts.call_wall, "Call wall", "#c0392b", "longdash", 1.5)
@@ -758,6 +787,137 @@ def render_calendar():
         st.write("•", n)
 
 
+# ── Master signal ────────────────────────────────────────────────────────────
+ACTION_ICON = {"LONG": "🟢", "SHORT": "🔴", "WAIT": "⏸️"}
+
+
+def render_signal():
+    if not signal.ok:
+        st.error(f"Master signal unavailable: {signal.error}")
+        return
+    st.subheader("Master signal")
+    c = st.columns(5)
+    c[0].metric("Score (±100)", f"{signal.score:+.1f}",
+                f"raw {signal.raw_total:+.1f} / ±{sum(cfg.LAYER_MAX.values())}",
+                delta_color="off")
+    c[1].metric("Action", f"{ACTION_ICON[signal.action]} {signal.action}",
+                None if signal.action != "WAIT" or signal.direction == "NEUTRAL"
+                else f"leaning {signal.direction.lower()}", delta_color="off")
+    c[2].metric("Tier", signal.tier)
+    c[3].metric("Size ×", f"{signal.size_mult:.2f}")
+    c[4].metric("Layers agreeing", f"{signal.agree} / 8", f"{signal.active} active",
+                delta_color="off")
+    if signal.blocked_by:
+        st.caption("Blocked by: " + ", ".join(signal.blocked_by))
+
+    left, right = st.columns([1, 1])
+    with left:
+        p = signal.plan
+        if p:
+            hdr = "Trade plan" if signal.action != "WAIT" else \
+                "Hypothetical plan (not actionable now)"
+            st.markdown(f"**{hdr} — {p['direction']}**")
+            rows = [
+                {"Level": "Entry zone", "GC=F": f"{p['zone'][0]:,.2f} – {p['zone'][1]:,.2f}",
+                 "XAUUSD spot": f"{p['zone'][0] - p['basis']:,.2f} – {p['zone'][1] - p['basis']:,.2f}",
+                 "Basis of level": f"last {p['entry']:,.2f}"},
+                {"Level": "Stop", "GC=F": f"{p['sl']:,.2f}", "XAUUSD spot": f"{p['spot']['sl']:,.2f}",
+                 "Basis of level": f"{p['stop_src']} · risk ${p['risk']:,.2f} "
+                                   f"({p['risk'] / p['atr']:.1f} ATR)"},
+                {"Level": "TP1", "GC=F": f"{p['tp1']:,.2f}", "XAUUSD spot": f"{p['spot']['tp1']:,.2f}",
+                 "Basis of level": p['tp1_src'] if p['tp1_src'].endswith("R")
+                 else f"{p['tp1_src']} · {p['rr1']:.1f}R"},
+                {"Level": "TP2", "GC=F": f"{p['tp2']:,.2f}", "XAUUSD spot": f"{p['spot']['tp2']:,.2f}",
+                 "Basis of level": p['tp2_src'] if p['tp2_src'].endswith("R")
+                 else f"{p['tp2_src']} · {p['rr2']:.1f}R"},
+            ]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.caption(f"Take {cfg.JOURNAL_TP1_PART:.0%} at TP1 and move the stop to entry. "
+                       f"Spot = GC=F − basis {p['basis']:+.2f} (sidebar).")
+        else:
+            st.caption("No directional plan — score below the C-tier threshold "
+                       f"(|score| < {cfg.TIERS[-1][0]}).")
+        if signal.rules:
+            st.markdown("**Rules fired**")
+            st.dataframe(pd.DataFrame(signal.rules).rename(columns={
+                "code": "Rule", "rule": "What", "effect": "Effect", "detail": "Detail"}),
+                hide_index=True, width="stretch")
+        for n in signal.notes:
+            st.write("•", n)
+    with right:
+        render_layer_bars()
+
+
+def render_layer_bars():
+    rows = list(reversed(signal.layers))
+    names = [f"{r['key']} {r['name']}" for r in rows]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=names, x=[r["max"] for r in rows], orientation="h",
+                         marker_color="rgba(128,128,128,0.12)", hoverinfo="skip",
+                         showlegend=False))
+    fig.add_trace(go.Bar(y=names, x=[-r["max"] for r in rows], orientation="h",
+                         marker_color="rgba(128,128,128,0.12)", hoverinfo="skip",
+                         showlegend=False))
+    fig.add_trace(go.Bar(
+        y=names, x=[r["score"] for r in rows], orientation="h",
+        marker_color=["#2a78d6" if r["score"] >= 0 else "#eb6834" for r in rows],
+        text=[("n/a" if not r["ok"] else f"{r['score']:+.1f}") for r in rows],
+        textposition="outside", showlegend=False,
+        hovertemplate="%{y}: %{x:+.1f}<extra></extra>"))
+    lim = max(cfg.LAYER_MAX.values()) * 1.25
+    fig.update_layout(height=320, barmode="overlay", margin=dict(l=10, r=20, t=40, b=20),
+                      title="Layer contributions (grey = each layer's max; blue bullish, "
+                            "orange bearish)", title_font_size=13,
+                      xaxis=dict(range=[-lim, lim], zeroline=True,
+                                 zerolinecolor="rgba(128,128,128,0.6)",
+                                 gridcolor="rgba(128,128,128,0.15)"),
+                      yaxis=dict(showgrid=False), bargap=0.35)
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_journal():
+    st.subheader("Forward-test journal")
+    df = st.session_state.get("journal_df")
+    if df is None:
+        df = xj.empty()
+    s_ = xj.stats(df, now)
+    c = st.columns(5)
+    c[0].metric("Closed trades", s_["closed"], f"{s_['open']} open", delta_color="off")
+    c[1].metric("Win rate (TP1 hit)", "—" if s_["win_rate"] is None else f"{s_['win_rate']:.0%}",
+                f"target {s_['target']:.0%}", delta_color="off")
+    c[2].metric("Net R", f"{s_['net_r']:+.2f}",
+                None if s_["avg_r"] is None else f"avg {s_['avg_r']:+.2f}R", delta_color="off")
+    c[3].metric("Test days", f"{s_['days']} / {s_['days_target']}")
+    c[4].metric("MT5 gate", "ready" if s_["on_track"] and s_["days"] >= s_["days_target"]
+                else "not yet", "needs ≥20 trades, ≥75%, 60 days", delta_color="off")
+    if len(df):
+        show = df.sort_values("bar_utc", ascending=False).head(25).copy()
+        show["bar (EAT)"] = show["bar_utc"].dt.tz_convert(cfg.DISPLAY_TZ).dt.strftime("%a %d %b %H:%M")
+        st.dataframe(show[["bar (EAT)", "direction", "tier", "score", "entry", "sl", "tp1",
+                           "tp2", "status", "r_mult", "regime"]],
+                     hide_index=True, width="stretch")
+    else:
+        st.caption("No signals logged yet. A trade is logged the first time the master "
+                   "action turns LONG or SHORT on a 15m bar.")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button("Download journal CSV", xj.to_csv_bytes(df),
+                           file_name="xau_journal.csv", mime="text/csv")
+    with d2:
+        up = st.file_uploader("Restore journal CSV", type=["csv"],
+                              label_visibility="collapsed")
+        if up is not None and st.session_state.get("_restored") != up.name:
+            restored = xj.from_csv_bytes(up.getvalue())
+            st.session_state["journal_df"] = restored
+            st.session_state["_restored"] = up.name
+            xj.save(restored)
+            st.success(f"Restored {len(restored)} journal rows.")
+    note = "" if _jsaved else " Saving to disk failed — the journal lives in this browser session."
+    st.caption("The journal only advances while the dashboard is open, and Streamlit Cloud "
+               "wipes files on reboot or redeploy — download it regularly and restore after "
+               "a push." + note + (f" ({_jerr})" if _jerr else ""))
+
+
 # ── Layer panels ─────────────────────────────────────────────────────────────
 def _bias_badge(bias):
     return {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT"}.get(bias, "⚪ NEUTRAL")
@@ -861,6 +1021,8 @@ with fcol1:
 with fcol2:
     panel("Options", render_options)
     panel("OI chart", render_oi_chart)
+with signal_slot.container():
+    panel("Master signal", render_signal)
 with gate_slot.container():
     panel("Gate banner", render_gate_banner)
 with regime_slot.container():
@@ -872,3 +1034,6 @@ with lcol:
     panel("Technicals", render_tech)
 with rcol:
     panel("Liquidity", render_liq)
+
+st.divider()
+panel("Journal", render_journal)
