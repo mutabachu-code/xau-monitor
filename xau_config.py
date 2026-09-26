@@ -13,7 +13,7 @@ Decisions (2026-09-26):
 from dataclasses import dataclass
 
 # Bumped whenever a phase adds settings; app.py refuses to run on an older copy.
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 from datetime import time
 from typing import Optional, Tuple
 
@@ -325,3 +325,73 @@ OPT_PTS = {"Skew": 3, "Put/call": 2, "Walls": 3, "Vol": 2}
 
 GVZ_DAILY_PERIOD = "1y"
 GVZ_SPIKE_PCT = 5.0                   # GVZ day change that counts as a move
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 6 — calendar and trading gates
+# ═════════════════════════════════════════════════════════════════════════════
+# Official dates verified 2026-09-26 against:
+#   BLS  bls.gov/schedule/news_release/{cpi,empsit,ppi}.htm
+#   BEA  bea.gov/news/schedule            (Personal Income & Outlays = PCE, GDP)
+#   Fed  federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   UST  home.treasury.gov tentative auction schedule (Q4 2026)
+# Times are US Eastern (ET); DST is applied per date. Add or override events
+# without touching code via xau_events.csv (date,time_et,name,impact).
+# (date, time ET, name, impact)
+CALENDAR_EVENTS = [
+    # FOMC — statement 14:00 ET, press conference 14:30 ET (SEP = dot plot)
+    ("2026-10-28", "14:00", "FOMC decision", "fomc"),
+    ("2026-12-09", "14:00", "FOMC decision + SEP", "fomc"),
+    ("2027-01-27", "14:00", "FOMC decision", "fomc"),
+    ("2027-03-17", "14:00", "FOMC decision + SEP", "fomc"),
+    # FOMC minutes — 3 weeks after each decision
+    ("2026-10-07", "14:00", "FOMC minutes (Sep)", "medium"),
+    ("2026-11-18", "14:00", "FOMC minutes (Oct)", "medium"),
+    ("2026-12-30", "14:00", "FOMC minutes (Dec)", "medium"),
+    # CPI
+    ("2026-10-14", "08:30", "CPI (Sep)", "high"),
+    ("2026-11-10", "08:30", "CPI (Oct)", "high"),
+    ("2026-12-10", "08:30", "CPI (Nov)", "high"),
+    # Employment Situation (NFP)
+    ("2026-10-02", "08:30", "NFP (Sep)", "high"),
+    ("2026-11-06", "08:30", "NFP (Oct)", "high"),
+    ("2026-12-04", "08:30", "NFP (Nov)", "high"),
+    # PPI
+    ("2026-10-15", "08:30", "PPI (Sep)", "high"),
+    ("2026-11-13", "08:30", "PPI (Oct)", "high"),
+    ("2026-12-15", "08:30", "PPI (Nov)", "high"),
+    # PCE (Personal Income & Outlays); GDP same time on the last three
+    ("2026-09-30", "08:30", "PCE (Aug)", "high"),
+    ("2026-10-29", "08:30", "PCE (Sep) + GDP Q3 adv", "high"),
+    ("2026-11-25", "08:30", "PCE (Oct) + GDP Q3 2nd", "high"),
+    ("2026-12-23", "08:30", "PCE (Nov) + GDP Q3 3rd", "high"),
+    # Treasury auctions — results 13:00 ET (Nov refunding not yet published)
+    ("2026-10-07", "13:00", "10y note auction", "medium"),
+    ("2026-10-08", "13:00", "30y bond auction", "medium"),
+    ("2026-12-08", "13:00", "10y note auction", "medium"),
+    ("2026-12-10", "13:00", "30y bond auction", "medium"),
+]
+CALENDAR_VALID_UNTIL = "2026-12-31"      # warn after this: refresh the event list
+
+# Rule-based recurring events
+CLAIMS_TIME = "08:30"                    # weekly jobless claims, Thursdays
+CLAIMS_MOVED = {"2026-11-26": "2026-11-25",   # Thanksgiving → Wednesday
+                "2026-12-24": "2026-12-23"}   # Christmas Eve → Wednesday
+ISM_MFG_TIME = "10:00"                   # 1st business day
+ISM_SVC_TIME = "10:00"                   # 3rd business day
+US_HOLIDAYS = {"2026-10-12": "Columbus Day (bond market shut)",
+               "2026-11-11": "Veterans Day (bond market shut)",
+               "2026-11-26": "Thanksgiving (CME closed)",
+               "2026-11-27": "Day after Thanksgiving (early close)",
+               "2026-12-24": "Christmas Eve (early close)",
+               "2026-12-25": "Christmas (CME closed)",
+               "2027-01-01": "New Year (CME closed)"}
+EVENTS_CSV = "xau_events.csv"
+
+# Windows (minutes before, minutes after): entries blocked inside
+GATE_WINDOWS = {"fomc": (60, 45), "high": (30, 15), "medium": (15, 10), "low": (5, 5)}
+CAUTION_BEFORE_HIGH_MIN = 120           # high/FOMC event within 2h → caution
+ROLLOVER_BLOCK_ET = ("16:45", "18:30")  # around the CME daily break (Mon–Thu)
+WEEKLY_OPEN_BLOCK_MIN = 30              # first 30 min after Sunday 18:00 ET reopen
+FRIDAY_CAUTION_ET = "15:00"             # late Friday: weekend-gap risk
+BLOCK_ON_EM_EXHAUSTED = True            # L7 flag: today's range ≥95% of expected move

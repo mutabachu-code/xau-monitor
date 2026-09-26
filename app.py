@@ -5,6 +5,7 @@ Phase 2: L1 rates, L2 dollar (correlation-weighted).
 Phase 3: L3 cross-asset agreement (implied move, structural bid, silver, metals).
 Phase 4: L8 regime classifier (which driver is in control, trade style).
 Phase 5: L4 flows/positioning (ETF, COT), L7 options/vol (GLD walls, skew, GVZ).
+Phase 6: calendar gates (FOMC, CPI, NFP, PPI, PCE, auctions, rollover, weekly open).
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
 futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
@@ -27,7 +28,7 @@ _APP_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _REQUIRED_FILES = ["xau_config.py", "xau_sessions.py", "xau_data.py", "xau_technicals.py",
                    "xau_liquidity.py", "xau_macro.py", "xau_rates.py", "xau_dollar.py",
                    "xau_crossasset.py", "xau_regime.py", "xau_runtime.py",
-                   "xau_flows.py", "xau_options.py"]
+                   "xau_flows.py", "xau_options.py", "xau_calendar.py"]
 _missing = [f for f in _REQUIRED_FILES if not _os.path.exists(_os.path.join(_APP_DIR, f))]
 if _missing:
     st.error("**Missing from the repo:** " + ", ".join(f"`{f}`" for f in _missing) +
@@ -35,6 +36,7 @@ if _missing:
              "on its own.")
     st.stop()
 
+import xau_calendar as xk
 import xau_config as cfg
 import xau_crossasset as xc
 import xau_data as xd
@@ -51,8 +53,8 @@ import xau_runtime as xrt
 
 # Reload project modules if a git push changed them (Streamlit Cloud can keep
 # stale copies in memory), dependency order: config first, app-level last.
-_reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo])
-REQUIRED_CONFIG_VERSION = 5
+_reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo, xk])
+REQUIRED_CONFIG_VERSION = 6
 if getattr(cfg, "CONFIG_VERSION", 0) < REQUIRED_CONFIG_VERSION:
     st.error(f"xau_config.py on the server is older than app.py expects "
              f"(version {getattr(cfg, 'CONFIG_VERSION', 'none')} < "
@@ -92,6 +94,7 @@ with st.sidebar:
     show_sweeps = st.checkbox("Liquidity sweeps", value=True)
     show_rsi = st.checkbox("RSI pane", value=True)
     show_walls = st.checkbox("Option walls (GLD → GC=F)", value=True)
+    show_events = st.checkbox("Economic events", value=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
     st.caption(f"Signal timeframe {cfg.SIGNAL_INTERVAL} · cache {cfg.CACHE_TTL_SEC}s · "
@@ -111,6 +114,7 @@ xasset = xc.get_xasset_report(bundle)
 regime = xg.get_regime_report(bundle, tech, rates, dollar, xasset)
 flows = xf.get_flow_report()
 opts = xo.get_options_report(gold, bundle["cross"].get("^GVZ"))
+gate = xk.get_gate_report(now, em_exhausted=bool(opts.flags.get("em_exhausted")))
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -136,6 +140,7 @@ def render_header():
 
 
 panel("Header", render_header)
+gate_slot = st.empty()            # filled once the gate helpers are defined
 regime_slot = st.empty()          # filled once the regime helpers are defined
 
 
@@ -260,6 +265,21 @@ def render_chart():
             fig.add_vrect(x0=_local(w["start"]), x1=_local(w["end"]),
                           fillcolor=cfg.BAND_COLORS[w["name"]], line_width=0,
                           layer="below", row="all", col=1)
+
+    if show_events and gate.ok:
+        x0, x1 = df.index[0], df.index[-1] + pd.Timedelta(hours=12)
+        for ev in xk.all_events((x0 - pd.Timedelta(days=1)).date(), x1.date()):
+            if not (x0 <= ev["when"] <= x1) or ev["impact"] not in ("fomc", "high", "medium"):
+                continue
+            big = ev["impact"] in ("fomc", "high")
+            fig.add_vline(x=_local(ev["when"]), line_width=1.2 if big else 0.8,
+                          line_dash="dash" if big else "dot",
+                          line_color="rgba(192,57,43,0.8)" if big else "rgba(128,128,128,0.6)",
+                          row="all", col=1)
+            if big:
+                fig.add_annotation(x=_local(ev["when"]), y=1.0, yref="paper", text=ev["name"],
+                                   showarrow=False, textangle=-90, xanchor="right",
+                                   yanchor="top", font=dict(size=9, color="#c0392b"))
 
     if fr is not None and show_vwap:
         fig.add_trace(go.Scatter(x=x, y=fr["vwap"], name="VWAP", mode="lines",
@@ -674,6 +694,70 @@ def render_oi_chart():
     st.plotly_chart(fig, width="stretch")
 
 
+# ── Calendar gates ───────────────────────────────────────────────────────────
+GATE_ICON = {"OPEN": "🟢", "CAUTION": "🟡", "BLOCKED": "🔴"}
+
+
+def _eat(ts):
+    return ts.astimezone(xs.DISP)
+
+
+def _countdown(mins):
+    if mins is None:
+        return "—"
+    d, rem = divmod(int(mins), 1440)
+    h, m = divmod(rem, 60)
+    return (f"{d}d " if d else "") + f"{h}h {m:02d}m"
+
+
+def render_gate_banner():
+    if not gate.ok:
+        st.warning("🟡 Entry gate: calendar check failed — trade manually around news. "
+                   f"({gate.error})")
+        return
+    lines = [f"**{GATE_ICON[gate.state]} Entry gate: {gate.state}**"]
+    if gate.reasons:
+        lines.append("Blocked by: " + "; ".join(gate.reasons))
+        if gate.resume_at:
+            lines.append(f"Clears at {_eat(gate.resume_at):%a %H:%M} EAT")
+    if gate.cautions:
+        lines.append("Caution: " + "; ".join(gate.cautions))
+    if gate.next_high:
+        lines.append(f"Next high-impact: **{gate.next_high['name']}** "
+                     f"{_eat(gate.next_high['when']):%a %d %b %H:%M} EAT "
+                     f"(in {_countdown(gate.mins_to_next_high)})")
+    box = {"OPEN": st.success, "CAUTION": st.warning, "BLOCKED": st.error}[gate.state]
+    box("  \n".join(lines))
+
+
+IMPACT_LABEL = {"fomc": "FOMC", "high": "High", "medium": "Medium", "low": "Low"}
+
+
+def render_calendar():
+    st.subheader("Economic calendar (EAT)")
+    if not gate.ok:
+        st.info(f"Calendar unavailable: {gate.error}")
+        return
+    rows = []
+    for ev in gate.upcoming:
+        pre, post = cfg.GATE_WINDOWS[ev["impact"]]
+        loc = _eat(ev["when"])
+        rows.append({"When (EAT)": f"{loc:%a %d %b %H:%M}", "Event": ev["name"],
+                     "Impact": IMPACT_LABEL[ev["impact"]],
+                     "Blocks": f"{_eat(ev['when'] - timedelta(minutes=pre)):%H:%M}–"
+                               f"{_eat(ev['when'] + timedelta(minutes=post)):%H:%M}",
+                     "In": _countdown((ev["when"] - now).total_seconds() / 60)})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.caption("No scheduled events in the lookahead window.")
+    st.caption("Dates verified against BLS, BEA, the Fed and Treasury on 26 Sep 2026. "
+               f"Add or override events in {cfg.EVENTS_CSV} (date,time_et,name,impact). "
+               "November 10y/30y refunding auction dates are not yet published.")
+    for n in gate.notes:
+        st.write("•", n)
+
+
 # ── Layer panels ─────────────────────────────────────────────────────────────
 def _bias_badge(bias):
     return {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT"}.get(bias, "⚪ NEUTRAL")
@@ -767,6 +851,9 @@ with gcol1:
 with gcol2:
     panel("Regime chart", render_regime_chart)
 st.divider()
+panel("Calendar", render_calendar)
+
+st.divider()
 fcol1, fcol2 = st.columns(2)
 with fcol1:
     panel("Flows", render_flows)
@@ -774,6 +861,8 @@ with fcol1:
 with fcol2:
     panel("Options", render_options)
     panel("OI chart", render_oi_chart)
+with gate_slot.container():
+    panel("Gate banner", render_gate_banner)
 with regime_slot.container():
     panel("Regime banner", render_regime_banner)
 
