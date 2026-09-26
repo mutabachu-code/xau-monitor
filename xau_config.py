@@ -102,3 +102,56 @@ BAND_COLORS = {
     "New York": "rgba(245, 166, 35, 0.07)",
     "London–NY overlap": "rgba(46, 204, 113, 0.12)",
 }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 1 — Layer 5 technicals (±25) and Layer 6 liquidity (±15)
+# ═════════════════════════════════════════════════════════════════════════════
+TECH_MAX = 25
+LIQ_MAX = 15
+
+EMA_FAST, EMA_MID, EMA_SLOW = 9, 21, 50       # 15m
+HTF_EMA_FAST, HTF_EMA_SLOW = 50, 200          # 1h, resampled from 15m
+RSI_N = 14
+ATR_N = 14
+ADX_N = 14
+ADX_CHOP = 18                                 # below = chop, technical score damped
+CHOP_DAMPING = 0.6
+SWING_N = 2                                   # fractal half-width (bars each side)
+VWAP_SLOPE_BARS = 4
+VWAP_STRETCH_SIGMA = 2.0                      # beyond this, trend points halved
+RSI_DECAY_BARS = 5
+RSI_DECAY_DROP = 3.0                          # RSI points lost while price rises
+DIVERGENCE_LOOKBACK = 40                      # bars searched for swing pairs
+STRUCTURE_RECENT_BARS = 12                    # BoS/MSS counts as fresh within this
+ATR_REGIME_BARS = 480                         # ~5 trading days of 15m bars
+ATR_REGIMES = ((0.7, "compressed"), (1.3, "normal"), (2.0, "expanding"),
+               (float("inf"), "extreme"))
+
+CPR_LOOKBACK_DAYS = 20
+CPR_NARROW_PCT = 0.10                         # fallback thresholds (% of pivot)
+CPR_WIDE_PCT = 0.30
+
+TECH_BIAS_THRESHOLD = 8                       # |score| >= this gives LONG/SHORT
+
+# Liquidity
+SWEEP_SCAN_BARS = 16                          # bars searched for sweeps (4h)
+SWEEP_VALID_BARS = 8                          # sweep scores only if this recent (2h)
+SWEEP_EPS_ATR = 0.05                          # min pierce beyond level, in ATR
+SWEEP_RECLAIM_BARS = 2                        # bars allowed to close back inside
+SWEEP_BASE_PTS = 8
+SWEEP_RVOL_PTS = 3
+SWEEP_FOLLOW_PTS = 2
+SWEEP_FOLLOW_ATR = 0.25
+RVOL_CONFIRM = 1.5
+RVOL_DAYS = 20
+EQ_TOL_ATR = 0.10                             # equal highs/lows tolerance
+EQ_MIN_TOL = 1.5                              # $ floor for tolerance
+EQ_LOOKBACK_BARS = 96                         # one trading day
+
+LEVEL_WEIGHTS = {"PDH": 1.0, "PDL": 1.0, "PWH": 1.0, "PWL": 1.0,
+                 "Asia H": 0.9, "Asia L": 0.9, "EQH": 0.8, "EQL": 0.8,
+                 "Round": 0.5}
+SESSION_MULT = {"Asia": 0.5, "London": 1.0, "London–NY overlap": 1.0,
+                "New York": 0.8, "Closed": 0.0}
+LIQ_BIAS_THRESHOLD = 5

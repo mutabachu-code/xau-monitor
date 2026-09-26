@@ -1,5 +1,6 @@
 """
-XAU Monitor — gold (XAUUSD) intraday dashboard.  Phase 0: data, session clock, chart.
+XAU Monitor — gold (XAUUSD) intraday dashboard.
+Phase 0: data, session clock, chart.  Phase 1: L5 technicals, L6 liquidity.
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
 futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
@@ -13,10 +14,13 @@ st.set_page_config(page_title="XAU Monitor", page_icon="🟡", layout="wide")
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 import xau_config as cfg
 import xau_data as xd
+import xau_liquidity as xl
 import xau_sessions as xs
+import xau_technicals as xt
 
 
 def panel(name, fn, *args, **kwargs):
@@ -43,6 +47,12 @@ with st.sidebar:
     days_shown = st.slider("Trading days on chart", 1, 10, 3)
     show_bands = st.checkbox("Session bands", value=True)
     show_rounds = st.checkbox("Round-number levels", value=True)
+    st.subheader("Overlays")
+    show_vwap = st.checkbox("VWAP + σ bands", value=True)
+    show_emas = st.checkbox("EMA 9 / 21 / 50", value=True)
+    show_cpr = st.checkbox("CPR + R1/S1", value=True)
+    show_sweeps = st.checkbox("Liquidity sweeps", value=True)
+    show_rsi = st.checkbox("RSI pane", value=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
     st.caption(f"Signal timeframe {cfg.SIGNAL_INTERVAL} · cache {cfg.CACHE_TTL_SEC}s · "
@@ -53,6 +63,8 @@ bundle = panel("Data", xd.fetch_bundle) or {
     "gold": xd._empty(), "primary": cfg.PRIMARY, "cross": {}, "errors": ["data panel failed"],
     "fetched_at": now}
 gold = bundle["gold"]
+tech = xt.get_tech_report(gold)
+liq = xl.get_liq_report(gold)
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -170,59 +182,194 @@ def _gap_breaks(idx_local: pd.DatetimeIndex, step=pd.Timedelta(minutes=15)):
     return vals
 
 
+def _local(ts):
+    return pd.Timestamp(ts).tz_convert(cfg.DISPLAY_TZ).tz_localize(None)
+
+
 def render_chart():
     if gold.empty:
         return
     days = xs.trading_day_index(gold.index)
     keep = sorted(set(days))[-days_shown:]
-    df = gold[pd.Index(days).isin(keep)]
+    mask = pd.Index(days).isin(keep)
+    df = gold[mask]
     if df.empty:
         return
     td = keep[-1]
     x = df.index.tz_convert(cfg.DISPLAY_TZ).tz_localize(None)
+    fr = tech.frame[mask] if (tech.ok and tech.frame is not None) else None
 
-    fig = go.Figure(go.Candlestick(
+    rows = 2 if (show_rsi and fr is not None) else 1
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                        row_heights=[0.78, 0.22] if rows == 2 else [1.0])
+    fig.add_trace(go.Candlestick(
         x=x, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
         name=bundle["primary"], increasing_line_color="#26a69a",
-        decreasing_line_color="#ef5350"))
+        decreasing_line_color="#ef5350"), row=1, col=1)
 
     if show_bands:
         for w in xs.session_windows(df.index[0].to_pydatetime(),
                                     df.index[-1].to_pydatetime() + timedelta(minutes=15)):
-            fig.add_vrect(
-                x0=pd.Timestamp(w["start"]).tz_convert(cfg.DISPLAY_TZ).tz_localize(None),
-                x1=pd.Timestamp(w["end"]).tz_convert(cfg.DISPLAY_TZ).tz_localize(None),
-                fillcolor=cfg.BAND_COLORS[w["name"]], line_width=0, layer="below")
+            fig.add_vrect(x0=_local(w["start"]), x1=_local(w["end"]),
+                          fillcolor=cfg.BAND_COLORS[w["name"]], line_width=0,
+                          layer="below", row="all", col=1)
 
-    def hline(y, text, color, dash):
-        fig.add_hline(y=y, line_color=color, line_dash=dash, line_width=1,
-                      annotation_text=text, annotation_position="right",
-                      annotation_font_size=10, annotation_font_color=color)
+    if fr is not None and show_vwap:
+        fig.add_trace(go.Scatter(x=x, y=fr["vwap"], name="VWAP", mode="lines",
+                                 line=dict(color="#f1c40f", width=1.6)), row=1, col=1)
+        for k, dash in ((1, "dot"), (2, "dash")):
+            for sgn in (1, -1):
+                fig.add_trace(go.Scatter(
+                    x=x, y=fr["vwap"] + sgn * k * fr["sd"], mode="lines",
+                    name=f"VWAP {'+' if sgn > 0 else '−'}{k}σ", showlegend=False,
+                    line=dict(color="rgba(241,196,15,0.45)", width=1, dash=dash),
+                    hoverinfo="skip"), row=1, col=1)
+    if fr is not None and show_emas:
+        for col_, color in (("ema9", "#3498db"), ("ema21", "#9b59b6"), ("ema50", "#e74c3c")):
+            fig.add_trace(go.Scatter(x=x, y=fr[col_], name=col_.upper(), mode="lines",
+                                     line=dict(color=color, width=1)), row=1, col=1)
+
+    x_today0 = _local(xs.asian_window(td)["start"])
+    x_end = x[-1] + pd.Timedelta(minutes=15)
+
+    def seg(y, text, color, dash="solid", width=1):
+        fig.add_shape(type="line", x0=x_today0, x1=x_end, y0=y, y1=y,
+                      line=dict(color=color, dash=dash, width=width), row=1, col=1)
+        fig.add_annotation(x=x_end, y=y, text=text, showarrow=False, xanchor="left",
+                           font=dict(size=10, color=color), row=1, col=1)
+
+    if show_cpr and tech.ok and tech.cpr:
+        c = tech.cpr
+        fig.add_shape(type="rect", x0=x_today0, x1=x_end, y0=c["BC"], y1=c["TC"],
+                      fillcolor="rgba(52,152,219,0.18)", line_width=0, row=1, col=1)
+        seg(c["P"], "P", "#3498db", "dot")
+        seg(c["R1"], "R1", "#95a5a6", "dash")
+        seg(c["S1"], "S1", "#95a5a6", "dash")
+        vp = c.get("virgin_prior")
+        if vp:
+            fig.add_shape(type="rect", x0=x_today0, x1=x_end, y0=vp["BC"], y1=vp["TC"],
+                          fillcolor="rgba(0,0,0,0)", line=dict(color="#3498db", dash="dot"),
+                          row=1, col=1)
 
     asia = xs.asian_range(gold, td)
     if asia:
-        hline(asia["high"], "Asia H", "#9b59b6", "dot")
-        hline(asia["low"], "Asia L", "#9b59b6", "dot")
+        seg(asia["high"], "Asia H", "#9b59b6", "dot")
+        seg(asia["low"], "Asia L", "#9b59b6", "dot")
     pdl = xs.prev_day_levels(gold, td)
     if pdl:
-        hline(pdl["high"], "PDH", "#e67e22", "dash")
-        hline(pdl["low"], "PDL", "#e67e22", "dash")
+        seg(pdl["high"], "PDH", "#e67e22", "dash")
+        seg(pdl["low"], "PDL", "#e67e22", "dash")
+    if liq.ok:
+        for lv in liq.levels:
+            if lv.name in ("EQH", "EQL", "PWH", "PWL"):
+                lo_, hi_ = float(df["Low"].min()), float(df["High"].max())
+                if lo_ - 30 <= lv.price <= hi_ + 30:
+                    seg(lv.price, lv.name, "#16a085", "dashdot")
     if show_rounds:
         lo, hi = float(df["Low"].min()), float(df["High"].max())
         for lvl in xs.round_levels(float(df["Close"].iloc[-1])):
             if lo <= lvl <= hi:
-                fig.add_hline(y=lvl, line_color="rgba(150,150,150,0.35)", line_width=1)
+                fig.add_hline(y=lvl, line_color="rgba(150,150,150,0.35)", line_width=1,
+                              row=1, col=1)
+
+    if show_sweeps and liq.ok and liq.sweeps:
+        for sw in liq.sweeps:
+            bull = sw["dir"] == "bullish"
+            live = sw["points"] != 0
+            fig.add_trace(go.Scatter(
+                x=[_local(sw["time"])], y=[sw["extreme"]], mode="markers",
+                marker=dict(symbol="triangle-up" if bull else "triangle-down", size=13,
+                            color=("#26a69a" if bull else "#ef5350") if live else "#7f8c8d",
+                            line=dict(color="white", width=1)),
+                name=f"{sw['level']} sweep",
+                hovertext=f"{sw['level']} {sw['dir']} sweep · {sw['why']}",
+                hoverinfo="text", showlegend=False), row=1, col=1)
+
+    if rows == 2:
+        fig.add_trace(go.Scatter(x=x, y=fr["rsi"], name="RSI", mode="lines",
+                                 line=dict(color="#8e44ad", width=1.2)), row=2, col=1)
+        for lvl, clr in ((70, "#ef5350"), (50, "#7f8c8d"), (30, "#26a69a")):
+            fig.add_hline(y=lvl, line_color=clr, line_width=1, line_dash="dot", row=2, col=1)
+        fig.update_yaxes(range=[0, 100], title_text="RSI", row=2, col=1)
 
     fig.update_layout(
-        height=560, margin=dict(l=10, r=60, t=30, b=10), xaxis_rangeslider_visible=False,
-        showlegend=False, title=f"{bundle['primary']} {cfg.SIGNAL_INTERVAL} · EAT",
-        yaxis_title="GC=F ($)")
+        height=680 if rows == 2 else 560, margin=dict(l=10, r=70, t=30, b=10),
+        xaxis_rangeslider_visible=False, showlegend=True,
+        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+        title=f"{bundle['primary']} {cfg.SIGNAL_INTERVAL} · EAT")
+    fig.update_yaxes(title_text="GC=F ($)", row=1, col=1)
     breaks = _gap_breaks(x)
     if breaks:
         fig.update_xaxes(rangebreaks=[dict(values=breaks, dvalue=15 * 60 * 1000)])
     st.plotly_chart(fig, width="stretch")
     st.caption("Bands: blue = London, green = London–NY overlap, amber = New York. "
-               "Levels are futures prices; subtract the basis for broker spot.")
+               "Shaded blue box = today's CPR. Triangles = liquidity sweeps (grey = "
+               "expired or invalidated). Levels are futures prices; subtract the basis "
+               "for broker spot.")
+
+
+# ── Layer panels ─────────────────────────────────────────────────────────────
+def _bias_badge(bias):
+    return {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT"}.get(bias, "⚪ NEUTRAL")
+
+
+def render_tech():
+    st.subheader("L5 · Technicals")
+    if not tech.ok:
+        st.info(f"Technicals unavailable: {tech.error}")
+        return
+    c = st.columns(4)
+    c[0].metric(f"Score (±{cfg.TECH_MAX})", f"{tech.score:+.1f}", _bias_badge(tech.bias),
+                delta_color="off")
+    c[1].metric("RSI 14", f"{tech.rsi:.1f}")
+    c[2].metric("ADX", f"{tech.adx:.0f}", "chop" if tech.chop else "trending",
+                delta_color="off")
+    c[3].metric("ATR 15m", f"{tech.atr:.2f}", f"{tech.atr_regime} ({tech.atr_ratio:.1f}×)",
+                delta_color="off")
+    rows = [{"Component": k, "Points": v, "Max": m, "Reading": tech.details.get(k, "")}
+            for k, v, m in ((k, tech.components[k], mx) for k, mx in
+                            (("VWAP", 6), ("EMA stack", 5), ("1h trend", 4),
+                             ("Structure", 5), ("RSI", 3), ("CPR", 2)))]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    if tech.daily_atr:
+        st.caption(f"Daily ATR (avg range, last 14 days): ${tech.daily_atr:,.2f}")
+    for n in tech.notes:
+        st.write("•", n)
+
+
+def render_liq():
+    st.subheader("L6 · Liquidity")
+    if not liq.ok:
+        st.info(f"Liquidity unavailable: {liq.error}")
+        return
+    c = st.columns(4)
+    c[0].metric(f"Score (±{cfg.LIQ_MAX})", f"{liq.score:+.1f}", _bias_badge(liq.bias),
+                delta_color="off")
+    c[1].metric("RVOL now", f"{liq.rvol_now:.2f}×")
+    c[2].metric("Asian range", liq.asian_state)
+    act = liq.active
+    c[3].metric("Active sweep", "—" if not act else f"{act['level']} ({act['dir']})",
+                None if not act else f"{act['points']:+.1f} pts", delta_color="off")
+    if act:
+        st.caption(f"Active sweep scoring: {act['why']}")
+    t = liq.targets
+    tc = st.columns(2)
+    for col, key, label in ((tc[0], "above", "Buy-side liquidity above"),
+                            (tc[1], "below", "Sell-side liquidity below")):
+        v = t.get(key)
+        col.metric(label, "—" if not v else f"{v['name']} {v['price']:,.2f}",
+                   None if not v else f"${v['dist']:,.2f} · {v['atr_mult']:.1f} ATR",
+                   delta_color="off")
+    if liq.sweeps:
+        rows = [{"Time (EAT)": _local(s["time"]).strftime("%a %H:%M"), "Level": s["level"],
+                 "Price": round(s["price"], 2), "Direction": s["dir"],
+                 "RVOL": round(s["rvol"], 2), "Session": s["session"],
+                 "Points": s["points"], "Status": s["why"]} for s in reversed(liq.sweeps)]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.caption(f"No sweeps in the last {cfg.SWEEP_SCAN_BARS} bars.")
+    for n in liq.notes:
+        st.write("•", n)
 
 
 left, right = st.columns([3, 2])
@@ -230,3 +377,10 @@ with left:
     panel("Chart", render_chart)
 with right:
     panel("Session clock", render_clock)
+
+st.divider()
+lcol, rcol = st.columns(2)
+with lcol:
+    panel("Technicals", render_tech)
+with rcol:
+    panel("Liquidity", render_liq)
