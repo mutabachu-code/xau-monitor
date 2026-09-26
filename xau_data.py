@@ -66,7 +66,8 @@ def fetch_bundle(interval: str = cfg.SIGNAL_INTERVAL,
     """{'gold': df, 'primary': ticker, 'cross': {ticker: df}, 'errors': [...],
     'fetched_at': utc datetime}"""
     errors: List[str] = []
-    tickers = [cfg.PRIMARY] + list(cfg.CROSS_ASSETS)
+    extra = list(getattr(cfg, "EXTRA_TICKERS", {}))
+    tickers = [cfg.PRIMARY] + list(cfg.CROSS_ASSETS) + extra
     try:
         raw = _download(tickers, interval, period)
     except Exception as e:
@@ -88,7 +89,7 @@ def fetch_bundle(interval: str = cfg.SIGNAL_INTERVAL,
         errors.append("no gold data available")
 
     cross = {}
-    for t in cfg.CROSS_ASSETS:
+    for t in list(cfg.CROSS_ASSETS) + extra:
         d = extract_ticker(raw, t)
         if d.empty:
             errors.append(f"{t} empty")

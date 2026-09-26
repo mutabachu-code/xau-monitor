@@ -155,3 +155,55 @@ LEVEL_WEIGHTS = {"PDH": 1.0, "PDL": 1.0, "PWH": 1.0, "PWL": 1.0,
 SESSION_MULT = {"Asia": 0.5, "London": 1.0, "London–NY overlap": 1.0,
                 "New York": 0.8, "Closed": 0.0}
 LIQ_BIAS_THRESHOLD = 5
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2 — Layer 1 rates (±20, dynamic) and Layer 2 dollar (±15, dynamic)
+# ═════════════════════════════════════════════════════════════════════════════
+RATES_MAX = 20
+DOLLAR_MAX = 15
+
+# Extra intraday tickers pulled in the same batch download (not in the strip).
+# Treasury futures trade ~23h on CME, unlike ^TNX which only updates in US hours.
+EXTRA_TICKERS = {
+    "ZN=F": "10y T-Note fut",
+    "ZT=F": "2y T-Note fut",
+    "^FVX": "US 5y",
+    "EURUSD=X": "EUR/USD",
+}
+# Approximate modified duration used to turn futures % moves into yield bp
+FUT_DURATION = {"ZN=F": 6.5, "ZT=F": 1.9}
+
+# FRED daily series (no API key needed for the CSV endpoint)
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+FRED_REAL_10Y = "DFII10"          # 10y TIPS real yield, %
+FRED_BREAKEVEN_10Y = "T10YIE"     # 10y breakeven inflation, %
+FRED_TTL_SEC = 6 * 3600
+FRED_TIMEOUT = 8
+REAL_YIELD_HIGH = 2.5             # WGC: level associated with high opportunity cost
+
+# Reference moves that map to a full-strength (±1) component
+REF_10Y_DAY_BP = 8.0
+REF_2Y_DAY_BP = 8.0
+REF_SPIKE_BP = 4.0                # 30-min move
+SPIKE_BARS = 2                    # 2 × 15m = 30 min
+SPIKE_FLAG_BP = 5.0               # G1: short-end up ≥5bp in 30 min
+REF_REAL_5D_BP = 10.0
+RATES_WEIGHTS = {"10y day": 0.30, "2y day": 0.30, "30-min spike": 0.20, "Real yield": 0.20}
+
+REF_DXY_DAY_PCT = 0.40
+REF_EUR_DAY_PCT = 0.40
+REF_JPY_DAY_PCT = 0.60
+REF_DXY_1H_PCT = 0.15
+DOLLAR_WEIGHTS = {"DXY day": 0.35, "EUR/USD day": 0.25, "USD/JPY day": 0.20,
+                  "DXY 1h": 0.20}
+
+# Correlation-driven weighting
+CORR_SHORT_DAYS = 5
+CORR_LONG_DAYS = 20
+BARS_PER_DAY = 92
+CORR_MIN_POINTS = 150
+CORR_FULL = 0.40                  # |inverse corr| at which the layer gets full weight
+CORR_BLEND_LONG = 0.6             # weight of the 20-day corr vs 5-day
+MACRO_STALE_MIN = 60              # drop an input whose last bar is this much older than gold
+MACRO_BIAS_FRAC = 0.30            # |score| ≥ this × max → LONG/SHORT

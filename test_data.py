@@ -70,7 +70,7 @@ def test_fetch_bundle_fallback(monkeypatch):
     b = fn()
     assert b["primary"] == "MGC=F" and not b["gold"].empty
     assert any("using MGC=F" in e for e in b["errors"])
-    assert set(b["cross"]) == set(cfg.CROSS_ASSETS)
+    assert set(cfg.CROSS_ASSETS) <= set(b["cross"])
 
 
 def test_fetch_bundle_total_failure(monkeypatch):

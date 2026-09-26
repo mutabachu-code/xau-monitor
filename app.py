@@ -1,6 +1,7 @@
 """
 XAU Monitor — gold (XAUUSD) intraday dashboard.
 Phase 0: data, session clock, chart.  Phase 1: L5 technicals, L6 liquidity.
+Phase 2: L1 rates, L2 dollar (correlation-weighted).
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
 futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
@@ -18,7 +19,9 @@ from plotly.subplots import make_subplots
 
 import xau_config as cfg
 import xau_data as xd
+import xau_dollar as xdl
 import xau_liquidity as xl
+import xau_rates as xr
 import xau_sessions as xs
 import xau_technicals as xt
 
@@ -65,6 +68,9 @@ bundle = panel("Data", xd.fetch_bundle) or {
 gold = bundle["gold"]
 tech = xt.get_tech_report(gold)
 liq = xl.get_liq_report(gold)
+fred = xr.load_fred()
+rates = xr.get_rates_report(bundle, fred)
+dollar = xdl.get_dollar_report(bundle)
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -137,8 +143,8 @@ def render_cross():
             delta = f"{ch['pct']:+.2f}%"
         col.metric(name, fmt(ch["last"], 3 if t in ("JPY=X",) or t in cfg.YIELD_TICKERS else 2),
                    delta)
-    st.caption("Change vs previous CME trading-day close. Phase 3 turns these into the "
-               "cross-asset agreement score.")
+    st.caption("Change vs previous CME trading-day close. DXY, yields and USD/JPY feed "
+               "L1/L2 below; Phase 3 adds the cross-asset agreement score.")
 
 
 panel("Cross-asset", render_cross)
@@ -308,6 +314,88 @@ def render_chart():
                "for broker spot.")
 
 
+# ── Macro layers (L1 rates, L2 dollar) ───────────────────────────────────────
+LINK_COLORS = {"Rates": "#2a78d6", "Dollar": "#eb6834"}   # validated categorical pair
+
+
+def _fmt_corr(c):
+    return "—" if c is None else f"{c:+.2f}"
+
+
+def render_macro(rep, title):
+    st.subheader(title)
+    if not rep.ok:
+        st.info(f"{rep.layer} layer unavailable: {rep.error}")
+        return
+    c = st.columns(4)
+    c[0].metric(f"Score (±{rep.max_pts})", f"{rep.score:+.1f}", _bias_badge(rep.bias),
+                delta_color="off")
+    wt = "—" if rep.weight is None else f"{rep.weight * 100:.0f}%"
+    c[1].metric("Layer weight", wt, f"max now ±{rep.eff_max:g}", delta_color="off")
+    c[2].metric("Corr 20d", _fmt_corr(rep.corr_long), f"5d {_fmt_corr(rep.corr_short)}",
+                delta_color="off",
+                help=f"{rep.corr_source}; textbook sign is {rep.corr_expected}")
+    c[3].metric("Raw signal", f"{rep.raw:+.2f}", "unweighted", delta_color="off")
+    rows = [{"Input": k, "Signal (−1…+1)": None if v is None else round(v, 2),
+             "Reading": rep.details.get(k, "")} for k, v in rep.components.items()]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(f"Correlation: {rep.corr_source}. Positive signal = bullish gold.")
+    for n in rep.notes:
+        st.write("•", n)
+
+
+def render_link_chart():
+    fig = go.Figure()
+    shown = False
+    for rep in (rates, dollar):
+        s = rep.corr_series
+        if not rep.ok or s is None or s.empty:
+            continue
+        orient = -1 if rep.corr_expected == "negative" else 1
+        h = (orient * s).resample("1h").last().dropna()
+        h.index = h.index.tz_convert(cfg.DISPLAY_TZ).tz_localize(None)
+        color = LINK_COLORS[rep.layer]
+        fig.add_trace(go.Scatter(x=h.index, y=h.values, mode="lines", name=rep.layer,
+                                 line=dict(color=color, width=2),
+                                 hovertemplate="%{x|%d %b %H:%M}<br>" + rep.layer +
+                                 " link %{y:.2f}<extra></extra>"))
+        shown = True
+    if not shown:
+        st.caption("Link-strength history needs more overlapping data.")
+        return
+    fig.add_hline(y=cfg.CORR_FULL, line_dash="dash", line_width=1,
+                  line_color="rgba(128,128,128,0.7)",
+                  annotation_text="full weight ≥ %.2f" % cfg.CORR_FULL,
+                  annotation_position="bottom left",
+                  annotation_font_size=10)
+    fig.add_hline(y=0, line_width=1, line_color="rgba(128,128,128,0.5)")
+    fig.update_layout(height=280, margin=dict(l=10, r=20, t=30, b=30),
+                      title="How strongly gold is trading off yields and the dollar "
+                            "(rolling 5-day, textbook direction = up)",
+                      title_font_size=13, hovermode="x unified",
+                      legend=dict(orientation="h", y=-0.2, x=0),
+                      yaxis=dict(range=[-1, 1], title="Link strength",
+                                 gridcolor="rgba(128,128,128,0.15)"),
+                      xaxis=dict(showgrid=False))
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_macro_readings():
+    rd = rates.readings if rates.ok else {}
+    bits = []
+    if rd.get("tnx_level") is not None:
+        bits.append(f"US 10y {rd['tnx_level']:.2f}%")
+    if rd.get("real_10y") is not None:
+        bits.append(f"10y real (TIPS) {rd['real_10y']:.2f}%")
+    if rd.get("breakeven_10y") is not None:
+        bits.append(f"10y breakeven {rd['breakeven_10y']:.2f}%")
+    if bits:
+        st.caption(" · ".join(bits) + " — real yield and breakeven are daily FRED data.")
+    elif fred and all(v is None for v in fred.values()):
+        st.caption("FRED real-yield data unavailable right now; the rates layer runs "
+                   "on intraday Treasury futures only.")
+
+
 # ── Layer panels ─────────────────────────────────────────────────────────────
 def _bias_badge(bias):
     return {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT"}.get(bias, "⚪ NEUTRAL")
@@ -377,6 +465,15 @@ with left:
     panel("Chart", render_chart)
 with right:
     panel("Session clock", render_clock)
+
+st.divider()
+mcol1, mcol2 = st.columns(2)
+with mcol1:
+    panel("Rates", render_macro, rates, "L1 · Rates")
+with mcol2:
+    panel("Dollar", render_macro, dollar, "L2 · Dollar")
+panel("Macro readings", render_macro_readings)
+panel("Link strength", render_link_chart)
 
 st.divider()
 lcol, rcol = st.columns(2)
