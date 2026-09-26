@@ -19,6 +19,20 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# Guard against partial pushes: name any project file missing from the repo
+# instead of crashing with a redacted ModuleNotFoundError.
+import os as _os
+_APP_DIR = _os.path.dirname(_os.path.abspath(__file__))
+_REQUIRED_FILES = ["xau_config.py", "xau_sessions.py", "xau_data.py", "xau_technicals.py",
+                   "xau_liquidity.py", "xau_macro.py", "xau_rates.py", "xau_dollar.py",
+                   "xau_crossasset.py", "xau_regime.py", "xau_runtime.py"]
+_missing = [f for f in _REQUIRED_FILES if not _os.path.exists(_os.path.join(_APP_DIR, f))]
+if _missing:
+    st.error("**Missing from the repo:** " + ", ".join(f"`{f}`" for f in _missing) +
+             "  \nUpload them to the repo root next to app.py; the app redeploys "
+             "on its own.")
+    st.stop()
+
 import xau_config as cfg
 import xau_crossasset as xc
 import xau_data as xd
