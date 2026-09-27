@@ -9,7 +9,9 @@ Phase 6: calendar gates (FOMC, CPI, NFP, PPI, PCE, auctions, rollover, weekly op
 Phase 7: master signal (±100, G1–G10, gates, plan) and forward-test journal.
 
 Chart and levels are in COMEX GC=F futures prices. Broker XAUUSD spot =
-futures minus the basis entered in the sidebar (fed live from MT5 at Phase 8).
+futures minus the basis — measured live from the Swissquote spot feed (or the
+manual sidebar value as a fallback). A 10-second ticker shows live spot, and the
+whole app recomputes on the sidebar auto-refresh interval.
 Every panel is isolated in try/except so one failure never white-screens the app.
 """
 from datetime import datetime, timedelta, timezone
@@ -30,7 +32,7 @@ _REQUIRED_FILES = ["xau_config.py", "xau_sessions.py", "xau_data.py", "xau_techn
                    "xau_liquidity.py", "xau_macro.py", "xau_rates.py", "xau_dollar.py",
                    "xau_crossasset.py", "xau_regime.py", "xau_runtime.py",
                    "xau_flows.py", "xau_options.py", "xau_calendar.py",
-                   "xau_master_signal.py", "xau_journal.py"]
+                   "xau_master_signal.py", "xau_journal.py", "xau_spot.py"]
 _missing = [f for f in _REQUIRED_FILES if not _os.path.exists(_os.path.join(_APP_DIR, f))]
 if _missing:
     st.error("**Missing from the repo:** " + ", ".join(f"`{f}`" for f in _missing) +
@@ -51,6 +53,7 @@ import xau_master_signal as xms
 import xau_rates as xr
 import xau_regime as xg
 import xau_sessions as xs
+import xau_spot as xsp
 import xau_technicals as xt
 import xau_macro as xm
 import xau_runtime as xrt
@@ -58,8 +61,8 @@ import xau_runtime as xrt
 # Reload project modules if a git push changed them (Streamlit Cloud can keep
 # stale copies in memory), dependency order: config first, app-level last.
 _reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo, xk,
-                              xms, xj])
-REQUIRED_CONFIG_VERSION = 7
+                              xms, xj, xsp])
+REQUIRED_CONFIG_VERSION = 8
 if getattr(cfg, "CONFIG_VERSION", 0) < REQUIRED_CONFIG_VERSION:
     st.error(f"xau_config.py on the server is older than app.py expects "
              f"(version {getattr(cfg, 'CONFIG_VERSION', 'none')} < "
@@ -84,11 +87,16 @@ def fmt(x, nd=2, prefix=""):
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Settings")
-    basis = st.number_input(
-        "Basis: GC=F minus broker XAUUSD ($)", value=float(cfg.DEFAULT_BASIS),
-        step=0.5, format="%.2f",
-        help="Check your MT5 XAUUSD price against GC=F and enter the difference. "
-             "Goes live from MT5 at Phase 8.")
+    basis_mode = st.radio(
+        "Basis (GC=F − spot)", ["Auto", "Manual"], horizontal=True,
+        help="Auto measures GC=F last − live XAUUSD spot (Swissquote) and uses the median "
+             "of recent readings. Manual uses the number below.")
+    basis_manual = st.number_input(
+        "Manual basis ($)", value=float(cfg.DEFAULT_BASIS), step=0.5, format="%.2f",
+        help="Used in Manual mode, and in Auto mode until the first live reading.")
+    refresh_label = st.selectbox("Auto-refresh (full recompute)", list(cfg.REFRESH_OPTIONS),
+                                 index=list(cfg.REFRESH_OPTIONS).index(cfg.REFRESH_DEFAULT))
+    live_ticker = st.checkbox(f"Live spot ticker (every {cfg.SPOT_TICK_SEC}s)", value=True)
     days_shown = st.slider("Trading days on chart", 1, 10, 3)
     show_bands = st.checkbox("Session bands", value=True)
     show_rounds = st.checkbox("Round-number levels", value=True)
@@ -103,14 +111,22 @@ with st.sidebar:
     show_plan = st.checkbox("Trade plan (entry / SL / TP)", value=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
-    st.caption(f"Signal timeframe {cfg.SIGNAL_INTERVAL} · cache {cfg.CACHE_TTL_SEC}s · "
-               f"times in EAT ({cfg.DISPLAY_TZ})")
+    st.caption(f"Signal timeframe {cfg.SIGNAL_INTERVAL} · Yahoo bars cached "
+               f"{cfg.CACHE_TTL_SEC}s · spot {cfg.SPOT_TTL_SEC}s · options 15 min · "
+               f"COT/FRED 6 h · times in EAT ({cfg.DISPLAY_TZ})")
 
 now = datetime.now(timezone.utc)
 bundle = panel("Data", xd.fetch_bundle) or {
     "gold": xd._empty(), "primary": cfg.PRIMARY, "cross": {}, "errors": ["data panel failed"],
     "fetched_at": now}
 gold = bundle["gold"]
+import time as _time
+st.session_state["_last_full"] = _time.time()
+spot = xsp.fetch_spot(now)
+basis_reading = xsp.live_basis(gold, spot, now)
+auto_basis = xsp.record_basis(xsp.basis_store(), basis_reading, now)
+_eb = xsp.effective_basis(basis_mode, basis_manual, auto_basis)
+basis, basis_src = _eb["basis"], _eb["source"]
 tech = xt.get_tech_report(gold)
 liq = xl.get_liq_report(gold)
 fred = xr.load_fred()
@@ -154,6 +170,49 @@ def render_header():
 
 
 panel("Header", render_header)
+
+_TICK = cfg.SPOT_TICK_SEC if live_ticker else 0
+_FULL = cfg.REFRESH_OPTIONS[refresh_label]
+_RUN_EVERY = min([x for x in (_TICK, _FULL) if x], default=None)
+
+
+@st.fragment(run_every=_RUN_EVERY)
+def live_strip():
+    now_f = datetime.now(timezone.utc)
+    sp = xsp.fetch_spot(now_f)
+    c = st.columns(5)
+    if sp:
+        c[0].metric("XAUUSD spot (live)", f"{sp['mid']:,.2f}",
+                    f"{sp['source']} · {sp['age_sec']:.0f}s old" + (" · STALE" if sp["stale"] else ""),
+                    delta_color="off")
+        c[1].metric("Spread", "—" if sp["spread"] is None else f"{sp['spread']:.2f}",
+                    None if sp["bid"] is None else f"bid {sp['bid']:,.2f} · ask {sp['ask']:,.2f}",
+                    delta_color="off")
+    else:
+        c[0].metric("XAUUSD spot (live)", "—", "spot feed unreachable", delta_color="off")
+        c[1].metric("Spread", "—")
+    if not gold.empty:
+        age = (now_f - gold.index[-1].to_pydatetime()).total_seconds() / 60
+        c[2].metric(f"{bundle['primary']} futures", f"{float(gold['Close'].iat[-1]):,.2f}",
+                    f"bar {age:.0f} min old (Yahoo)", delta_color="off")
+    rd = xsp.live_basis(gold, sp, now_f)
+    c[3].metric("Basis in use", f"{basis:+.2f}",
+                f"{basis_src.split(' (')[0]}" + ("" if rd["basis"] is None
+                                                 else f" · now {rd['basis']:+.2f}"),
+                delta_color="off")
+    since = _time.time() - st.session_state.get("_last_full", _time.time())
+    nxt = "off" if not _FULL else f"next in {max(0, _FULL - since):.0f}s"
+    c[4].metric("Last full refresh", f"{since:.0f}s ago", nxt, delta_color="off")
+    if basis_mode == "Manual" and auto_basis is not None and \
+            abs(basis_manual - auto_basis) > cfg.BASIS_DRIFT_WARN:
+        st.warning(f"Manual basis {basis_manual:+.2f} is {basis_manual - auto_basis:+.2f} away "
+                   f"from the live basis {auto_basis:+.2f} — spot levels will be off. "
+                   "Switch to Auto or update the value.")
+    if _FULL and since >= _FULL:
+        st.rerun()
+
+
+panel("Live prices", live_strip)
 gate_slot = st.empty()            # filled once the gate helpers are defined
 signal_slot = st.empty()          # master signal card
 regime_slot = st.empty()          # filled once the regime helpers are defined
@@ -173,8 +232,12 @@ def render_metrics():
     c = st.columns(6)
     c[0].metric(f"{bundle['primary']} last", fmt(ch["last"]),
                 None if ch["change"] is None else f"{ch['change']:+,.2f} ({ch['pct']:+.2f}%)")
-    c[1].metric("XAUUSD spot est.", fmt(xd.to_spot(ch["last"], basis)),
-                f"basis {basis:+.2f}", delta_color="off")
+    if spot:
+        c[1].metric("XAUUSD spot", fmt(spot["mid"]), f"live · basis {basis:+.2f}",
+                    delta_color="off")
+    else:
+        c[1].metric("XAUUSD spot est.", fmt(xd.to_spot(ch["last"], basis)),
+                    f"GC=F − basis {basis:+.2f}", delta_color="off")
     c[2].metric("Asian high", fmt(asia["high"]) if asia else "—")
     c[3].metric("Asian low", fmt(asia["low"]) if asia else "—")
     c[4].metric("Prev day high", fmt(pdl["high"]) if pdl else "—")
@@ -852,7 +915,7 @@ def render_signal():
             ]
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
             st.caption(f"Take {cfg.JOURNAL_TP1_PART:.0%} at TP1 and move the stop to entry. "
-                       f"Spot = GC=F − basis {p['basis']:+.2f} (sidebar).")
+                       f"Spot = GC=F − basis {p['basis']:+.2f} ({basis_src}).")
         else:
             st.caption("No directional plan — score below the C-tier threshold "
                        f"(|score| < {cfg.TIERS[-1][0]}).")

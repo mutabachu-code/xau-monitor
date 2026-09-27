@@ -13,7 +13,7 @@ Decisions (2026-09-26):
 from dataclasses import dataclass
 
 # Bumped whenever a phase adds settings; app.py refuses to run on an older copy.
-CONFIG_VERSION = 7
+CONFIG_VERSION = 8
 from datetime import time
 from typing import Optional, Tuple
 
@@ -43,7 +43,7 @@ SIGNAL_INTERVAL = "15m"
 SIGNAL_PERIOD = "60d"             # yfinance max for sub-hourly bars
 HTF_INTERVAL = "1h"
 HTF_PERIOD = "180d"
-CACHE_TTL_SEC = 120
+CACHE_TTL_SEC = 60                # yfinance bundle (NAS100 uses 60s too)
 STALE_AFTER_MIN = 45              # warn if last bar older than this while market open
 
 # ── Pricing ──────────────────────────────────────────────────────────────────
@@ -430,3 +430,22 @@ TARGET_BUFFER_ATR = 0.1
 JOURNAL_CSV = "xau_journal.csv"
 JOURNAL_EXPIRY_BARS = 48                           # 12h of 15m bars, then close at market
 JOURNAL_TP1_PART = 0.5                             # take half at TP1, stop to breakeven
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Live spot price, automatic basis, refresh
+# ═════════════════════════════════════════════════════════════════════════════
+SPOT_SOURCES = [
+    ("Swissquote", "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"),
+    ("gold-api", "https://api.gold-api.com/price/XAU"),
+]
+SPOT_TTL_SEC = 10                 # spot quote cache
+SPOT_TIMEOUT = 5
+SPOT_STALE_SEC = 120              # quote older than this is flagged stale
+SPOT_TICK_SEC = 10                # live ticker refresh
+BASIS_GC_MAX_AGE_MIN = 20         # GC=F bar must be this fresh to measure the basis
+BASIS_BOUNDS = (-10.0, 150.0)     # sanity range for GC=F − spot ($)
+BASIS_HISTORY = 10                # readings kept; the median is used
+BASIS_DRIFT_WARN = 5.0            # warn if manual basis is this far from live
+REFRESH_OPTIONS = {"Off": 0, "30 s": 30, "1 min": 60, "2 min": 120, "5 min": 300}
+REFRESH_DEFAULT = "1 min"
