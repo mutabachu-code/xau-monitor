@@ -219,3 +219,64 @@ def test_report_carries_cpr_read():
               "setup", "relationship", "type_bias", "virgin_today", "flip"):
         assert k in cp
     assert cp["relationship"].startswith("higher value")
+
+
+# ── RSI pullback check at TC / BC ────────────────────────────────────────────
+def _pb(closes, rsis, lows=None, highs=None):
+    df = bars_from_closes(closes, wick=0.5)
+    for k, v in (lows or {}).items():
+        df.iloc[k, df.columns.get_loc("Low")] = v
+    for k, v in (highs or {}).items():
+        df.iloc[k, df.columns.get_loc("High")] = v
+    return df, pd.Series(rsis, index=df.index, dtype=float)
+
+
+CP = {"P": 4300.0, "TC": 4302.0, "BC": 4298.0}     # zone z = max(4×0.3, 0.25×4) = 1.2
+
+
+def test_long_pullback_confirmed_and_turning():
+    closes = [4315, 4318, 4320, 4312, 4306, 4304, 4308, 4312, 4316, 4318]
+    rsis = [62, 64, 66, 55, 49, 47, 51, 55, 58, 60]
+    df, r = _pb(closes, rsis, lows={5: 4302.5})
+    out = xt.cpr_rsi_pullback(df, r, CP, 4.0)
+    assert out["side"] == "long" and out["state"] == "CONFIRMED"
+    assert out["rsi_at"] == 47 and out["turning"]
+
+
+def test_long_pullback_caution_and_rejected():
+    closes = [4315, 4318, 4320, 4312, 4306, 4304, 4306, 4307]
+    df, r = _pb(closes, [62, 64, 66, 52, 45, 42, 44, 45], lows={5: 4302.5})
+    assert xt.cpr_rsi_pullback(df, r, CP, 4.0)["state"] == "CAUTION"
+    df, r = _pb(closes, [62, 64, 66, 48, 38, 34, 37, 39], lows={5: 4302.5})
+    out = xt.cpr_rsi_pullback(df, r, CP, 4.0)
+    assert out["state"] == "REJECTED" and "skip the long" in out["text"]
+
+
+def test_long_waiting_without_touch():
+    df, r = _pb([4315, 4318, 4320, 4322, 4321], [60, 62, 64, 65, 63])
+    assert xt.cpr_rsi_pullback(df, r, CP, 4.0)["state"] == "WAITING"
+
+
+def test_short_bounce_confirmed_and_rejected():
+    closes = [4285, 4282, 4280, 4288, 4294, 4296, 4291, 4287]
+    df, r = _pb(closes, [38, 36, 34, 44, 51, 53, 47, 42], highs={5: 4297.5})
+    out = xt.cpr_rsi_pullback(df, r, CP, 4.0)
+    assert out["side"] == "short" and out["state"] == "CONFIRMED" and out["turning"]
+    df, r = _pb(closes, [38, 36, 34, 50, 58, 63, 60, 57], highs={5: 4297.5})
+    assert xt.cpr_rsi_pullback(df, r, CP, 4.0)["state"] == "REJECTED"
+
+
+def test_hidden_bullish_divergence():
+    # earlier low 4304 with RSI 52; later pullback low 4302.5 (higher) with RSI 47 (lower)
+    closes = [4306, 4305, 4310, 4318, 4320, 4312, 4306, 4304, 4308, 4312, 4316, 4318]
+    rsis = [53, 52, 58, 64, 66, 55, 49, 47, 51, 55, 58, 60]
+    df, r = _pb(closes, rsis, lows={1: 4301.0, 7: 4302.5})
+    out = xt.cpr_rsi_pullback(df, r, CP, 4.0)
+    assert out["state"] == "CONFIRMED" and out["hidden_div"]
+
+
+def test_inside_cpr_no_read_and_report_field():
+    df, r = _pb([4300, 4300.5, 4299.5], [50, 51, 49])
+    assert xt.cpr_rsi_pullback(df, r, CP, 4.0)["state"] == "n/a"
+    d = trading_days(4, price_fn=lambda k, n: zigzag(n, 4300 + 70 * k, drift=0.8, amp=3))
+    assert "rsi_pullback" in xt.get_tech_report(d).cpr

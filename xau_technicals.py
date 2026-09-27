@@ -296,6 +296,86 @@ def cpr_setup(cp: Dict, price: float, atr: float, virgin_today: bool) -> Dict:
     return {"price_vs_cpr": pos, "setup": setup, "width_abs": w}
 
 
+# ── RSI pullback check at TC / BC ────────────────────────────────────────────
+RSI_PB_LOOKBACK = 8          # bars searched for the pullback into TC / BC (2h)
+RSI_PB_TOUCH_ATR = 0.25      # touch tolerance around TC / BC (min vs CPR zone)
+RSI_BULL_RESET = 45.0        # long: pullback RSI holding ≥45 = healthy reset
+RSI_BULL_FAIL = 40.0         # long: pullback RSI <40 = momentum collapsed
+RSI_BEAR_RESET = 55.0        # short: bounce RSI staying ≤55 = healthy reset
+RSI_BEAR_FAIL = 60.0         # short: bounce RSI >60 = momentum flipped
+RSI_TURN_PTS = 2.0           # RSI up/down this much from the extreme = turning
+
+
+def cpr_rsi_pullback(today: pd.DataFrame, r_today: pd.Series, cp: Dict,
+                     atr: float) -> Dict:
+    """Did the latest pullback into TC (longs) / BC (shorts) keep RSI in its
+    reset zone, or did momentum break? Also flags hidden divergence."""
+    out = {"side": None, "state": "n/a", "rsi_at": None, "rsi_now": None,
+           "turning": False, "hidden_div": False, "bar_time": None, "text": ""}
+    if today is None or len(today) < 3 or r_today is None or r_today.isna().all():
+        return out
+    tc, bc = cp["TC"], cp["BC"]
+    z = max((tc - bc) * CPR_ZONE_MULT, RSI_PB_TOUCH_ATR * atr)
+    price = float(today["Close"].iat[-1])
+    sub, rs = today.iloc[-RSI_PB_LOOKBACK:], r_today.iloc[-RSI_PB_LOOKBACK:]
+    out["rsi_now"] = float(r_today.iat[-1])
+    earlier, r_earlier = today.iloc[:-RSI_PB_LOOKBACK], r_today.iloc[:-RSI_PB_LOOKBACK]
+
+    if price > tc:
+        out["side"] = "long"
+        touched = (sub["Low"] <= tc + z).to_numpy()
+        if not touched.any():
+            out.update(state="WAITING", text="No pullback into TC yet — wait for the dip")
+            return out
+        rs_t = rs[touched]
+        i = rs_t.idxmin()
+        rsi_at = float(rs_t.min())
+        out.update(rsi_at=rsi_at, bar_time=i,
+                   turning=out["rsi_now"] >= rsi_at + RSI_TURN_PTS)
+        if rsi_at >= RSI_BULL_RESET:
+            state, txt = "CONFIRMED", f"pullback to TC held RSI {rsi_at:.0f} (≥45) — healthy reset"
+        elif rsi_at >= RSI_BULL_FAIL:
+            state, txt = "CAUTION", f"RSI dipped to {rsi_at:.0f} (40–45) — soft, wait for RSI to turn up"
+        else:
+            state, txt = "REJECTED", f"RSI collapsed to {rsi_at:.0f} (<40) — momentum broke, skip the long"
+        pb_low = float(sub["Low"][touched].min())
+        if len(earlier) >= 3:
+            j = earlier["Low"].idxmin()
+            if pb_low > float(earlier["Low"].min()) and rsi_at < float(r_earlier.loc[j]):
+                out["hidden_div"] = True
+                txt += "; hidden bullish divergence (higher low in price, lower low in RSI)"
+    elif price < bc:
+        out["side"] = "short"
+        touched = (sub["High"] >= bc - z).to_numpy()
+        if not touched.any():
+            out.update(state="WAITING", text="No bounce into BC yet — wait for the rally")
+            return out
+        rs_t = rs[touched]
+        i = rs_t.idxmax()
+        rsi_at = float(rs_t.max())
+        out.update(rsi_at=rsi_at, bar_time=i,
+                   turning=out["rsi_now"] <= rsi_at - RSI_TURN_PTS)
+        if rsi_at <= RSI_BEAR_RESET:
+            state, txt = "CONFIRMED", f"bounce to BC kept RSI {rsi_at:.0f} (≤55) — healthy reset"
+        elif rsi_at <= RSI_BEAR_FAIL:
+            state, txt = "CAUTION", f"RSI lifted to {rsi_at:.0f} (55–60) — soft, wait for RSI to turn down"
+        else:
+            state, txt = "REJECTED", f"RSI surged to {rsi_at:.0f} (>60) — momentum flipped, skip the short"
+        pb_high = float(sub["High"][touched].max())
+        if len(earlier) >= 3:
+            j = earlier["High"].idxmax()
+            if pb_high < float(earlier["High"].max()) and rsi_at > float(r_earlier.loc[j]):
+                out["hidden_div"] = True
+                txt += "; hidden bearish divergence (lower high in price, higher high in RSI)"
+    else:
+        out.update(state="n/a", text="Price inside CPR — no TC/BC pullback read")
+        return out
+    if out["turning"] and state != "REJECTED":
+        txt += "; RSI now turning " + ("up" if out["side"] == "long" else "down")
+    out.update(state=state, text=txt[0].upper() + txt[1:])
+    return out
+
+
 # ── HTF ──────────────────────────────────────────────────────────────────────
 def resample_1h(df: pd.DataFrame) -> pd.DataFrame:
     return df.resample("1h", label="left", closed="left").agg(
@@ -487,6 +567,8 @@ def compute(df: pd.DataFrame) -> TechReport:
             cp["relationship"] = cpr_relationship(cp, prev_row)
             cp.update(cpr_flip(today_bars, cp))
             cp.update(cpr_setup(cp, price, float(a.iat[-1]), cp["virgin_today"]))
+            cp["rsi_pullback"] = cpr_rsi_pullback(today_bars, r.loc[today_bars.index], cp,
+                                                  float(a.iat[-1]))
         except Exception:  # noqa: BLE001
             pass
         s = 2 if price > cp["TC"] else -2 if price < cp["BC"] else 0

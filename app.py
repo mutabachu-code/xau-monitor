@@ -394,8 +394,22 @@ def render_chart():
     if rows == 2:
         fig.add_trace(go.Scatter(x=x, y=fr["rsi"], name="RSI", mode="lines",
                                  line=dict(color="#8e44ad", width=1.2)), row=2, col=1)
-        for lvl, clr in ((70, "#ef5350"), (50, "#7f8c8d"), (30, "#26a69a")):
+        fig.add_hrect(y0=45, y1=55, fillcolor="rgba(128,128,128,0.12)", line_width=0,
+                      row=2, col=1)
+        for lvl, clr in ((70, "#ef5350"), (60, "#e67e22"), (50, "#7f8c8d"),
+                         (40, "#e67e22"), (30, "#26a69a")):
             fig.add_hline(y=lvl, line_color=clr, line_width=1, line_dash="dot", row=2, col=1)
+        pb = (tech.cpr or {}).get("rsi_pullback") if tech.ok else None
+        if pb and pb.get("bar_time") is not None and pb.get("rsi_at") is not None:
+            col = {"CONFIRMED": "#27ae60", "CAUTION": "#e67e22",
+                   "REJECTED": "#c0392b"}.get(pb["state"], "#7f8c8d")
+            fig.add_trace(go.Scatter(
+                x=[_local(pb["bar_time"])], y=[pb["rsi_at"]], mode="markers",
+                marker=dict(size=11, color=col, symbol="circle",
+                            line=dict(color="white", width=1)),
+                name="RSI pullback", showlegend=False,
+                hovertext=f"TC/BC pullback RSI {pb['rsi_at']:.0f} — {pb['state']}",
+                hoverinfo="text"), row=2, col=1)
         fig.update_yaxes(range=[0, 100], title_text="RSI", row=2, col=1)
 
     fig.update_layout(
@@ -1001,16 +1015,26 @@ def render_cpr():
         lines.append(f"**{su['direction']}** zone {z0:,.2f}–{z1:,.2f} (spot "
                      f"{z0 - basis:,.2f}–{z1 - basis:,.2f}) · target {su['target']:,.2f} · "
                      f"invalid {su['invalid']:,.2f}")
+    pb = cp.get("rsi_pullback") or {}
+    if pb.get("text"):
+        icon = {"CONFIRMED": "✅", "CAUTION": "⚠️", "REJECTED": "⛔", "WAITING": "⏳"}.get(
+            pb["state"], "")
+        lines.append(f"**RSI pullback check:** {icon} {pb['state']} — {pb['text']}")
     if cp.get("flip"):
         t = cp.get("flip_time")
         when = "" if t is None else f" at {_local(t):%H:%M} EAT"
         lines.append(f"**Flip:** {cp['flip']}{when}")
     if lines:
-        box = st.success if su.get("direction") == "BUY" else \
-            st.error if su.get("direction") == "SELL" else st.info
+        if pb.get("state") == "REJECTED" and su.get("direction"):
+            box = st.warning
+        else:
+            box = st.success if su.get("direction") == "BUY" else \
+                st.error if su.get("direction") == "SELL" else st.info
         box("  \n".join(lines))
     st.caption("CPR setup is a stand-alone read like the NAS100 scalping engine; "
-               "the master signal only uses CPR position (±2 in L5).")
+               "the master signal only uses CPR position (±2 in L5). RSI pullback check: "
+               "longs want the dip into TC to hold RSI ≥45 (not <40); shorts want the "
+               "bounce into BC to keep RSI ≤55 (not >60). Grey band on the RSI pane = 45–55.")
 
 
 def render_liq():
