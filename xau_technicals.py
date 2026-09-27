@@ -201,6 +201,101 @@ def cpr_table(daily: pd.DataFrame) -> pd.DataFrame:
     return t
 
 
+# ── CPR read (display + setup, same rules as the NAS100 scalping engine) ─────
+CPR_ZONE_MULT = 0.3          # entry zone = level ± CPR width × 0.3
+CPR_AT_LEVEL_ATR = 0.25      # "at R1/S1" = within 0.25 ATR (or beyond)
+CPR_TYPE_BIAS = {
+    "narrow": "Trending day likely — strong directional move expected",
+    "moderate": "Mixed day — watch for breakout direction from CPR",
+    "wide": "Sideways/choppy day likely — fade extremes, avoid breakouts",
+}
+
+
+def cpr_relationship(today: Dict, prev: Optional[Dict]) -> str:
+    """Today's CPR against yesterday's (two-day relationship)."""
+    if not prev:
+        return "n/a"
+    t_tc, t_bc, p_tc, p_bc = today["TC"], today["BC"], prev["TC"], prev["BC"]
+    if t_bc > p_tc:
+        return "higher value (bullish)"
+    if t_tc < p_bc:
+        return "lower value (bearish)"
+    if t_tc <= p_tc and t_bc >= p_bc:
+        return "inside (breakout likely)"
+    if t_tc >= p_tc and t_bc <= p_bc:
+        return "outside (range likely)"
+    return "overlapping higher (mild bullish)" if t_tc > p_tc else \
+        "overlapping lower (mild bearish)"
+
+
+def cpr_flip(today: pd.DataFrame, cp: Dict) -> Dict:
+    """Most recent close-through of TC (up) or BC (down) today, and whether it held."""
+    if today is None or len(today) < 2:
+        return {"flip": None, "flip_time": None}
+    c = today["Close"].to_numpy()
+    tc, bc = cp["TC"], cp["BC"]
+    last = None
+    for i in range(1, len(c)):
+        if c[i - 1] <= tc < c[i]:
+            last = ("TC", "up", i)
+        elif c[i - 1] >= bc > c[i]:
+            last = ("BC", "down", i)
+        elif c[i - 1] > tc >= c[i]:
+            last = ("TC", "lost", i)
+        elif c[i - 1] < bc <= c[i]:
+            last = ("BC", "reclaimed", i)
+    if last is None:
+        return {"flip": None, "flip_time": None}
+    lvl, how, i = last
+    t = today.index[i]
+    text = {"up": "TC flipped to support", "down": "BC flipped to resistance",
+            "lost": "lost TC — flip failed, back inside", "reclaimed":
+            "reclaimed BC — flip failed, back inside"}[how]
+    return {"flip": text, "flip_time": t}
+
+
+def cpr_setup(cp: Dict, price: float, atr: float, virgin_today: bool) -> Dict:
+    """Setup per CPR width, mirroring the NAS100 rules."""
+    w = cp["TC"] - cp["BC"]
+    z = max(w * CPR_ZONE_MULT, 0.1 * atr)
+    pos = "ABOVE_TC" if price > cp["TC"] else "BELOW_BC" if price < cp["BC"] else "INSIDE"
+    kind = cp.get("width_class", "moderate")
+    at = CPR_AT_LEVEL_ATR * atr
+    setup = {"direction": None, "zone": None, "target": None, "invalid": None, "text": ""}
+    if kind == "narrow":
+        if pos == "ABOVE_TC":
+            setup.update(direction="BUY", zone=(cp["TC"] - z, cp["TC"] + z), target=cp["R1"],
+                         invalid=cp["BC"], text="Narrow CPR, above TC — buy dips to TC, "
+                         "target R1, invalid below BC")
+        elif pos == "BELOW_BC":
+            setup.update(direction="SELL", zone=(cp["BC"] - z, cp["BC"] + z), target=cp["S1"],
+                         invalid=cp["TC"], text="Narrow CPR, below BC — sell bounces to BC, "
+                         "target S1, invalid above TC")
+        else:
+            setup["text"] = "Narrow CPR, inside — wait for the TC/BC break; expect a trend"
+    elif kind == "wide":
+        if price >= cp["R1"] - at:
+            setup.update(direction="SELL", zone=(cp["R1"] - at, cp["R1"] + at), target=cp["P"],
+                         invalid=cp["R2"], text="Wide CPR, at R1 — fade with a sell to P; "
+                         "avoid new longs")
+        elif price <= cp["S1"] + at:
+            setup.update(direction="BUY", zone=(cp["S1"] - at, cp["S1"] + at), target=cp["P"],
+                         invalid=cp["S2"], text="Wide CPR, at S1 — fade with a buy to P; "
+                         "avoid new shorts")
+        else:
+            setup["text"] = "Wide CPR — range day; fade R1/S1, avoid breakouts"
+    else:
+        if pos == "INSIDE":
+            setup["text"] = "Moderate CPR, inside — wait for TC/BC breakout confirmation"
+        elif pos == "ABOVE_TC":
+            setup["text"] = "Moderate CPR, above TC — breakout up; lean long on holds of TC"
+        else:
+            setup["text"] = "Moderate CPR, below BC — breakdown; lean short on rejections of BC"
+    if virgin_today:
+        setup["text"] += ". CPR untouched today (virgin) — price magnet to P"
+    return {"price_vs_cpr": pos, "setup": setup, "width_abs": w}
+
+
 # ── HTF ──────────────────────────────────────────────────────────────────────
 def resample_1h(df: pd.DataFrame) -> pd.DataFrame:
     return df.resample("1h", label="left", closed="left").agg(
@@ -382,6 +477,18 @@ def compute(df: pd.DataFrame) -> TechReport:
             rep.notes.append(f"Yesterday's CPR {pv['BC']:,.2f}–{pv['TC']:,.2f} "
                              "was never traded (virgin) — magnet level")
         rep.cpr = cp
+        try:                                   # display extras; never affects the score
+            days_arr = np.asarray(xs.trading_day_index(df.index))
+            today_bars = df[days_arr == td]
+            prev_row = ct.iloc[ct.index.get_loc(td) - 1].to_dict() \
+                if ct.index.get_loc(td) > 0 else None
+            cp["virgin_today"] = bool(cp.get("virgin"))
+            cp["type_bias"] = CPR_TYPE_BIAS.get(cp["width_class"], "")
+            cp["relationship"] = cpr_relationship(cp, prev_row)
+            cp.update(cpr_flip(today_bars, cp))
+            cp.update(cpr_setup(cp, price, float(a.iat[-1]), cp["virgin_today"]))
+        except Exception:  # noqa: BLE001
+            pass
         s = 2 if price > cp["TC"] else -2 if price < cp["BC"] else 0
         comp["CPR"] = s
         det["CPR"] = f"{cp['width_class']} ({cp['width_pct']:.2f}%), price " + \

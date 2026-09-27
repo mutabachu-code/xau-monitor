@@ -327,6 +327,11 @@ def render_chart():
         seg(c["P"], "P", "#3498db", "dot")
         seg(c["R1"], "R1", "#95a5a6", "dash")
         seg(c["S1"], "S1", "#95a5a6", "dash")
+        lo_v, hi_v = float(df["Low"].min()), float(df["High"].max())
+        pad = (hi_v - lo_v) * 0.15
+        for k in ("R2", "R3", "S2", "S3"):
+            if lo_v - pad <= c[k] <= hi_v + pad:
+                seg(c[k], k, "#b2babb", "dot")
         vp = c.get("virgin_prior")
         if vp:
             fig.add_shape(type="rect", x0=x_today0, x1=x_end, y0=vp["BC"], y1=vp["TC"],
@@ -945,6 +950,67 @@ def render_tech():
         st.caption(f"Daily ATR (avg range, last 14 days): ${tech.daily_atr:,.2f}")
     for n in tech.notes:
         st.write("•", n)
+    render_cpr()
+
+
+CPR_ORDER = ["R3", "R2", "R1", "TC", "P", "BC", "S1", "S2", "S3"]
+POS_LABEL = {"ABOVE_TC": "Above TC", "BELOW_BC": "Below BC", "INSIDE": "Inside CPR"}
+
+
+def render_cpr():
+    cp = tech.cpr if tech.ok else None
+    if not cp or "P" not in cp:
+        return
+    price = float(tech.price)
+    atr = float(tech.atr) or 1.0
+    st.markdown("**CPR — today's levels** (from the previous CME day's H/L/C)")
+    c = st.columns(2) + st.columns(2)
+    c[0].metric("CPR type", str(cp.get("width_class", "—")).capitalize(),
+                f"{cp['width_pct']:.2f}% · ${cp.get('width_abs', cp['TC'] - cp['BC']):,.2f}",
+                delta_color="off")
+    c[1].metric("Price vs CPR", POS_LABEL.get(cp.get("price_vs_cpr"), "—"))
+    c[2].metric("Virgin today", "Yes" if cp.get("virgin_today") else "No",
+                "magnet to P" if cp.get("virgin_today") else "CPR tested", delta_color="off")
+    rel = cp.get("relationship", "n/a")
+    c[3].metric("vs yesterday", rel.split(" (")[0].capitalize(),
+                rel.split(" (")[1].rstrip(")") if " (" in rel else None, delta_color="off")
+    if cp.get("type_bias"):
+        st.caption(cp["type_bias"])
+
+    rows, placed = [], False
+    for k in CPR_ORDER:
+        lv = float(cp[k])
+        if not placed and price > lv:
+            rows.append({"Level": "▶ price", "GC=F": f"{price:,.2f}",
+                         "Spot": f"{price - basis:,.2f}", "Distance": "—"})
+            placed = True
+        d = lv - price
+        rows.append({"Level": k, "GC=F": f"{lv:,.2f}", "Spot": f"{lv - basis:,.2f}",
+                     "Distance": f"{d:+,.2f} ({d / atr:+.1f} ATR)"})
+    if not placed:
+        rows.append({"Level": "▶ price", "GC=F": f"{price:,.2f}",
+                     "Spot": f"{price - basis:,.2f}", "Distance": "—"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=388)
+
+    su = cp.get("setup") or {}
+    lines = []
+    if su.get("text"):
+        lines.append(f"**Setup:** {su['text']}")
+    if su.get("direction"):
+        z0, z1 = su["zone"]
+        lines.append(f"**{su['direction']}** zone {z0:,.2f}–{z1:,.2f} (spot "
+                     f"{z0 - basis:,.2f}–{z1 - basis:,.2f}) · target {su['target']:,.2f} · "
+                     f"invalid {su['invalid']:,.2f}")
+    if cp.get("flip"):
+        t = cp.get("flip_time")
+        when = "" if t is None else f" at {_local(t):%H:%M} EAT"
+        lines.append(f"**Flip:** {cp['flip']}{when}")
+    if lines:
+        box = st.success if su.get("direction") == "BUY" else \
+            st.error if su.get("direction") == "SELL" else st.info
+        box("  \n".join(lines))
+    st.caption("CPR setup is a stand-alone read like the NAS100 scalping engine; "
+               "the master signal only uses CPR position (±2 in L5).")
 
 
 def render_liq():

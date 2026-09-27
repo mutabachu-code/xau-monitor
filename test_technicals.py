@@ -168,3 +168,54 @@ def test_report_never_raises():
     bad = bars_from_closes(trend(100)).drop(columns=["High"])
     r = xt.get_tech_report(bad)
     assert not r.ok and r.error
+
+
+# ── CPR read (levels display, relationship, flip, setup) ─────────────────────
+def _cp(p=4300.0, w=4.0, cls="narrow"):
+    c = {"P": p, "TC": p + w / 2, "BC": p - w / 2, "R1": p + 30, "R2": p + 60,
+         "S1": p - 30, "S2": p - 60, "width_class": cls}
+    return c
+
+
+def test_cpr_relationship_cases():
+    t = _cp(4300)
+    assert xt.cpr_relationship(t, _cp(4280)).startswith("higher value")
+    assert xt.cpr_relationship(t, _cp(4320)).startswith("lower value")
+    assert xt.cpr_relationship(_cp(4300, 2), _cp(4300, 8)).startswith("inside")
+    assert xt.cpr_relationship(_cp(4300, 8), _cp(4300, 2)).startswith("outside")
+    assert xt.cpr_relationship(_cp(4302, 6), _cp(4300, 6)).startswith("overlapping higher")
+    assert xt.cpr_relationship(t, None) == "n/a"
+
+
+def test_cpr_flip_detection():
+    cp = _cp(4300)
+    up = bars_from_closes([4299, 4300, 4303, 4305])
+    assert xt.cpr_flip(up, cp)["flip"] == "TC flipped to support"
+    failed = bars_from_closes([4299, 4303, 4301])
+    assert "flip failed" in xt.cpr_flip(failed, cp)["flip"]
+    down = bars_from_closes([4300, 4297, 4295])
+    assert xt.cpr_flip(down, cp)["flip"] == "BC flipped to resistance"
+    assert xt.cpr_flip(bars_from_closes([4300, 4300.5]), cp)["flip"] is None
+
+
+def test_cpr_setup_rules():
+    s = xt.cpr_setup(_cp(cls="narrow"), 4310, 4.0, False)
+    assert s["price_vs_cpr"] == "ABOVE_TC" and s["setup"]["direction"] == "BUY"
+    assert s["setup"]["target"] == 4330 and s["setup"]["invalid"] == 4298
+    s = xt.cpr_setup(_cp(cls="narrow"), 4290, 4.0, False)
+    assert s["setup"]["direction"] == "SELL" and s["setup"]["target"] == 4270
+    s = xt.cpr_setup(_cp(cls="wide"), 4329.5, 4.0, False)
+    assert s["setup"]["direction"] == "SELL" and s["setup"]["target"] == 4300
+    s = xt.cpr_setup(_cp(cls="wide"), 4271, 4.0, False)
+    assert s["setup"]["direction"] == "BUY"
+    s = xt.cpr_setup(_cp(cls="moderate"), 4300, 4.0, True)
+    assert s["setup"]["direction"] is None and "virgin" in s["setup"]["text"]
+
+
+def test_report_carries_cpr_read():
+    df = trading_days(4, price_fn=lambda k, n: zigzag(n, 4300 + 70 * k, drift=0.8, amp=3))
+    cp = xt.get_tech_report(df).cpr
+    for k in ("P", "TC", "BC", "R1", "R2", "R3", "S1", "S2", "S3", "price_vs_cpr",
+              "setup", "relationship", "type_bias", "virgin_today", "flip"):
+        assert k in cp
+    assert cp["relationship"].startswith("higher value")
