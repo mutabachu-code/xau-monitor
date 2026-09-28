@@ -100,6 +100,8 @@ def test_volume_proxy_fallback():
 
 
 def test_flows_nothing_reachable_and_fetch_failure(monkeypatch):
+    import xau_bg as xb
+    xb.reset()
     assert not xf.get_flow_report(fetch=False).ok
 
     def boom(*a, **k):
@@ -111,6 +113,8 @@ def test_flows_nothing_reachable_and_fetch_failure(monkeypatch):
 
 
 def test_fetch_cot_parses_response(monkeypatch):
+    import xau_bg as xb
+    xb.reset()
     payload = json.dumps(cot_records([10_000, 20_000])).encode()
 
     class Resp(io.BytesIO):

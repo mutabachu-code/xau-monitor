@@ -13,7 +13,7 @@ Decisions (2026-09-26):
 from dataclasses import dataclass
 
 # Bumped whenever a phase adds settings; app.py refuses to run on an older copy.
-CONFIG_VERSION = 8
+CONFIG_VERSION = 9
 from datetime import time
 from typing import Optional, Tuple
 
@@ -440,7 +440,7 @@ SPOT_SOURCES = [
     ("gold-api", "https://api.gold-api.com/price/XAU"),
 ]
 SPOT_TTL_SEC = 10                 # spot quote cache
-SPOT_TIMEOUT = 5
+SPOT_TIMEOUT = 3
 SPOT_STALE_SEC = 120              # quote older than this is flagged stale
 SPOT_TICK_SEC = 10                # live ticker refresh
 BASIS_GC_MAX_AGE_MIN = 20         # GC=F bar must be this fresh to measure the basis
@@ -449,3 +449,15 @@ BASIS_HISTORY = 10                # readings kept; the median is used
 BASIS_DRIFT_WARN = 5.0            # warn if manual basis is this far from live
 REFRESH_OPTIONS = {"Off": 0, "30 s": 30, "1 min": 60, "2 min": 120, "5 min": 300}
 REFRESH_DEFAULT = "1 min"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Speed: background refresh, incremental downloads, failure back-off
+# ═════════════════════════════════════════════════════════════════════════════
+BUNDLE_INCR_PERIOD = "5d"         # after the first load only this much is re-downloaded
+BUNDLE_FULL_REFRESH_SEC = 6 * 3600
+BUNDLE_KEEP_DAYS = 62             # trim merged history to this many calendar days
+BUNDLE_WAIT_FIRST = 45            # first page load waits at most this long for data
+BG_NEG_TTL = 300                  # failed source: don't retry for 5 min
+BG_WAIT_FIRST = 8                 # other sources: first load waits at most this long
+SPOT_NEG_TTL = 60                 # spot feed unreachable: back off 60 s

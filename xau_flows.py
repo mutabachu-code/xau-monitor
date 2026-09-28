@@ -20,6 +20,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+import xau_bg as xb
 import xau_config as cfg
 import xau_data as xd
 
@@ -54,7 +55,6 @@ def parse_cot(records: List[Dict]) -> pd.DataFrame:
     return df
 
 
-@_cot_cache
 def _cot_raw() -> pd.DataFrame:
     req = urllib.request.Request(cfg.COT_URL, headers={"User-Agent": "xau-monitor/1.0"})
     with urllib.request.urlopen(req, timeout=cfg.COT_TIMEOUT) as resp:
@@ -65,14 +65,10 @@ def _cot_raw() -> pd.DataFrame:
     return df
 
 
-def fetch_cot() -> Optional[pd.DataFrame]:
-    try:
-        return _cot_raw()
-    except Exception:  # noqa: BLE001
-        return None
+def fetch_cot(wait: float = cfg.BG_WAIT_FIRST) -> Optional[pd.DataFrame]:
+    return xb.swr("cot", _cot_raw, cfg.COT_TTL_SEC, cfg.BG_NEG_TTL, wait)
 
 
-@_etf_cache
 def _etf_daily_raw() -> Dict[str, pd.DataFrame]:
     raw = xd._download(cfg.ETF_TICKERS, "1d", cfg.ETF_DAILY_PERIOD)
     out = {t: xd.extract_ticker(raw, t) for t in cfg.ETF_TICKERS}
@@ -81,14 +77,10 @@ def _etf_daily_raw() -> Dict[str, pd.DataFrame]:
     return out
 
 
-def fetch_etf_daily() -> Optional[Dict[str, pd.DataFrame]]:
-    try:
-        return _etf_daily_raw()
-    except Exception:  # noqa: BLE001
-        return None
+def fetch_etf_daily(wait: float = cfg.BG_WAIT_FIRST) -> Optional[Dict[str, pd.DataFrame]]:
+    return xb.swr("etf_daily", _etf_daily_raw, cfg.ETF_TTL_SEC, cfg.BG_NEG_TTL, wait)
 
 
-@_etf_cache
 def _gld_shares_raw() -> pd.Series:
     import yfinance as yf
     start = (pd.Timestamp.now('UTC') - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
@@ -99,11 +91,15 @@ def _gld_shares_raw() -> pd.Series:
     return s.astype(float)
 
 
-def fetch_gld_shares() -> Optional[pd.Series]:
-    try:
-        return _gld_shares_raw()
-    except Exception:  # noqa: BLE001
-        return None
+def fetch_gld_shares(wait: float = cfg.BG_WAIT_FIRST) -> Optional[pd.Series]:
+    return xb.swr("gld_shares", _gld_shares_raw, cfg.ETF_TTL_SEC, cfg.BG_NEG_TTL, wait)
+
+
+def prefetch() -> None:
+    """Start every flows download in parallel without waiting."""
+    fetch_cot(0)
+    fetch_gld_shares(0)
+    fetch_etf_daily(0)
 
 
 # ── Components ───────────────────────────────────────────────────────────────

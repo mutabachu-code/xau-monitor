@@ -32,7 +32,7 @@ _REQUIRED_FILES = ["xau_config.py", "xau_sessions.py", "xau_data.py", "xau_techn
                    "xau_liquidity.py", "xau_macro.py", "xau_rates.py", "xau_dollar.py",
                    "xau_crossasset.py", "xau_regime.py", "xau_runtime.py",
                    "xau_flows.py", "xau_options.py", "xau_calendar.py",
-                   "xau_master_signal.py", "xau_journal.py", "xau_spot.py"]
+                   "xau_master_signal.py", "xau_journal.py", "xau_spot.py", "xau_bg.py"]
 _missing = [f for f in _REQUIRED_FILES if not _os.path.exists(_os.path.join(_APP_DIR, f))]
 if _missing:
     st.error("**Missing from the repo:** " + ", ".join(f"`{f}`" for f in _missing) +
@@ -40,6 +40,7 @@ if _missing:
              "on its own.")
     st.stop()
 
+import xau_bg as xb
 import xau_calendar as xk
 import xau_config as cfg
 import xau_crossasset as xc
@@ -62,7 +63,7 @@ import xau_runtime as xrt
 # stale copies in memory), dependency order: config first, app-level last.
 _reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo, xk,
                               xms, xj, xsp])
-REQUIRED_CONFIG_VERSION = 8
+REQUIRED_CONFIG_VERSION = 9
 if getattr(cfg, "CONFIG_VERSION", 0) < REQUIRED_CONFIG_VERSION:
     st.error(f"xau_config.py on the server is older than app.py expects "
              f"(version {getattr(cfg, 'CONFIG_VERSION', 'none')} < "
@@ -111,12 +112,25 @@ with st.sidebar:
     show_plan = st.checkbox("Trade plan (entry / SL / TP)", value=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
+        xb.reset()
     st.caption(f"Signal timeframe {cfg.SIGNAL_INTERVAL} · Yahoo bars cached "
                f"{cfg.CACHE_TTL_SEC}s · spot {cfg.SPOT_TTL_SEC}s · options 15 min · "
                f"COT/FRED 6 h · times in EAT ({cfg.DISPLAY_TZ})")
 
 now = datetime.now(timezone.utc)
-bundle = panel("Data", xd.fetch_bundle) or {
+# Start every slow download in parallel (background threads, no waiting) …
+def _prefetch():
+    xr.load_fred(wait=0)
+    xf.prefetch()
+    xo.prefetch()
+
+
+try:
+    _prefetch()
+except Exception:  # noqa: BLE001 — prefetch is an optimisation, never fatal
+    pass
+# … then take the price bundle: instant after the first load, refreshed behind the scenes.
+bundle = panel("Data", xd.get_bundle) or {
     "gold": xd._empty(), "primary": cfg.PRIMARY, "cross": {}, "errors": ["data panel failed"],
     "fetched_at": now}
 gold = bundle["gold"]
@@ -163,10 +177,24 @@ def render_header():
         cols[3].metric("Next event", nxt["label"],
                        f"in {mins // 60}h {mins % 60:02d}m · {nxt['start']:%H:%M}",
                        delta_color="off")
-    if bundle["errors"]:
-        with st.expander(f"Data notes ({len(bundle['errors'])})"):
-            for e in bundle["errors"]:
-                st.write("•", e)
+    stat = xb.status()
+    bad = {k: v for k, v in stat.items() if v["error"]}
+    n = len(bundle["errors"]) + len(bad)
+    with st.expander(f"Data sources & notes ({n})" if n else "Data sources"):
+        rows = [{"Source": k, "Age": "—" if v["age_s"] is None else f"{v['age_s']}s",
+                 "Updating": "yes" if v["busy"] else "", "Last error": v["error"],
+                 "Retry in": f"{v['retry_in_s']}s" if v["error"] else ""}
+                for k, v in sorted(stat.items())]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        mode = bundle.get("mode", "full")
+        st.caption(f"Price bars: last {mode} download "
+                   f"{(now - bundle['fetched_at']).total_seconds():.0f}s ago · "
+                   f"refreshed in the background every {cfg.CACHE_TTL_SEC}s "
+                   f"({cfg.BUNDLE_INCR_PERIOD} incremental, full reload every "
+                   f"{cfg.BUNDLE_FULL_REFRESH_SEC // 3600} h).")
+        for e in bundle["errors"]:
+            st.write("•", e)
 
 
 panel("Header", render_header)
@@ -316,6 +344,63 @@ def _local(ts):
     return pd.Timestamp(ts).tz_convert(cfg.DISPLAY_TZ).tz_localize(None)
 
 
+class _ShapeBatch:
+    """Collects shapes/annotations and applies them in one update_layout call.
+    Plotly's add_shape/add_hline copy the whole shape list on every call, which
+    made ~60 level lines cost ~0.5 s per refresh."""
+
+    def __init__(self, fig):
+        self.fig, self.sh, self.an = fig, [], []
+
+    @staticmethod
+    def _refs(row):
+        return ("x", "y") if row in (1, None) else (f"x{row}", f"y{row}")
+
+    @staticmethod
+    def _line(kw):
+        line = dict(kw.pop("line", {}) or {})
+        for k in ("color", "width", "dash"):
+            if f"line_{k}" in kw:
+                line[k] = kw.pop(f"line_{k}")
+        return line
+
+    def add_shape(self, row=1, col=None, **kw):
+        xr, yr = self._refs(row)
+        kw.setdefault("xref", xr)
+        kw.setdefault("yref", yr)
+        kw["line"] = self._line(kw)
+        self.sh.append(kw)
+
+    def add_annotation(self, row=1, col=None, **kw):
+        xr, yr = self._refs(row)
+        kw.setdefault("xref", xr)
+        kw.setdefault("yref", yr)
+        self.an.append(kw)
+
+    def add_hline(self, y, row=1, col=None, **kw):
+        xr, yr = self._refs(row)
+        self.sh.append(dict(type="line", xref=f"{xr} domain", x0=0, x1=1, yref=yr,
+                            y0=y, y1=y, line=self._line(kw)))
+
+    def add_hrect(self, y0, y1, row=1, col=None, fillcolor=None, line_width=0, **kw):
+        xr, yr = self._refs(row)
+        self.sh.append(dict(type="rect", xref=f"{xr} domain", x0=0, x1=1, yref=yr,
+                            y0=y0, y1=y1, fillcolor=fillcolor, line=dict(width=line_width),
+                            layer="below"))
+
+    def add_vline(self, x, row="all", col=None, **kw):
+        self.sh.append(dict(type="line", xref="x", x0=x, x1=x, yref="paper", y0=0, y1=1,
+                            line=self._line(kw)))
+
+    def add_vrect(self, x0, x1, row="all", col=None, fillcolor=None, line_width=0,
+                  layer="below", **kw):
+        self.sh.append(dict(type="rect", xref="x", x0=x0, x1=x1, yref="paper", y0=0, y1=1,
+                            fillcolor=fillcolor, line=dict(width=line_width), layer=layer))
+
+    def flush(self):
+        self.fig.update_layout(shapes=self.sh, annotations=self.an)
+
+
 def render_chart():
     if gold.empty:
         return
@@ -336,11 +421,12 @@ def render_chart():
         x=x, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
         name=bundle["primary"], increasing_line_color="#26a69a",
         decreasing_line_color="#ef5350"), row=1, col=1)
+    B = _ShapeBatch(fig)
 
     if show_bands:
         for w in xs.session_windows(df.index[0].to_pydatetime(),
                                     df.index[-1].to_pydatetime() + timedelta(minutes=15)):
-            fig.add_vrect(x0=_local(w["start"]), x1=_local(w["end"]),
+            B.add_vrect(x0=_local(w["start"]), x1=_local(w["end"]),
                           fillcolor=cfg.BAND_COLORS[w["name"]], line_width=0,
                           layer="below", row="all", col=1)
 
@@ -350,12 +436,12 @@ def render_chart():
             if not (x0 <= ev["when"] <= x1) or ev["impact"] not in ("fomc", "high", "medium"):
                 continue
             big = ev["impact"] in ("fomc", "high")
-            fig.add_vline(x=_local(ev["when"]), line_width=1.2 if big else 0.8,
+            B.add_vline(x=_local(ev["when"]), line_width=1.2 if big else 0.8,
                           line_dash="dash" if big else "dot",
                           line_color="rgba(192,57,43,0.8)" if big else "rgba(128,128,128,0.6)",
                           row="all", col=1)
             if big:
-                fig.add_annotation(x=_local(ev["when"]), y=1.0, yref="paper", text=ev["name"],
+                B.add_annotation(x=_local(ev["when"]), y=1.0, yref="paper", text=ev["name"],
                                    showarrow=False, textangle=-90, xanchor="right",
                                    yanchor="top", font=dict(size=9, color="#c0392b"))
 
@@ -378,14 +464,14 @@ def render_chart():
     x_end = x[-1] + pd.Timedelta(minutes=15)
 
     def seg(y, text, color, dash="solid", width=1):
-        fig.add_shape(type="line", x0=x_today0, x1=x_end, y0=y, y1=y,
+        B.add_shape(type="line", x0=x_today0, x1=x_end, y0=y, y1=y,
                       line=dict(color=color, dash=dash, width=width), row=1, col=1)
-        fig.add_annotation(x=x_end, y=y, text=text, showarrow=False, xanchor="left",
+        B.add_annotation(x=x_end, y=y, text=text, showarrow=False, xanchor="left",
                            font=dict(size=10, color=color), row=1, col=1)
 
     if show_cpr and tech.ok and tech.cpr:
         c = tech.cpr
-        fig.add_shape(type="rect", x0=x_today0, x1=x_end, y0=c["BC"], y1=c["TC"],
+        B.add_shape(type="rect", x0=x_today0, x1=x_end, y0=c["BC"], y1=c["TC"],
                       fillcolor="rgba(52,152,219,0.18)", line_width=0, row=1, col=1)
         seg(c["P"], "P", "#3498db", "dot")
         seg(c["R1"], "R1", "#95a5a6", "dash")
@@ -397,7 +483,7 @@ def render_chart():
                 seg(c[k], k, "#b2babb", "dot")
         vp = c.get("virgin_prior")
         if vp:
-            fig.add_shape(type="rect", x0=x_today0, x1=x_end, y0=vp["BC"], y1=vp["TC"],
+            B.add_shape(type="rect", x0=x_today0, x1=x_end, y0=vp["BC"], y1=vp["TC"],
                           fillcolor="rgba(0,0,0,0)", line=dict(color="#3498db", dash="dot"),
                           row=1, col=1)
 
@@ -416,10 +502,10 @@ def render_chart():
         x_plan0 = x[max(0, len(x) - 24)]
         for y, txt, col in ((pl["entry"], "Entry", "#7f8c8d"), (pl["sl"], "SL", "#c0392b"),
                             (pl["tp1"], "TP1", "#27ae60"), (pl["tp2"], "TP2", "#1e8449")):
-            fig.add_shape(type="line", x0=x_plan0, x1=x_end, y0=y, y1=y,
+            B.add_shape(type="line", x0=x_plan0, x1=x_end, y0=y, y1=y,
                           line=dict(color=col, width=1.6 if live else 1, dash=dash),
                           row=1, col=1)
-            fig.add_annotation(x=x_plan0, y=y, text=f"{txt} {y:,.1f}", showarrow=False,
+            B.add_annotation(x=x_plan0, y=y, text=f"{txt} {y:,.1f}", showarrow=False,
                                xanchor="right", font=dict(size=10, color=col),
                                bgcolor="rgba(255,255,255,0.8)", borderpad=1, row=1, col=1)
 
@@ -438,7 +524,7 @@ def render_chart():
         lo, hi = float(df["Low"].min()), float(df["High"].max())
         for lvl in xs.round_levels(float(df["Close"].iloc[-1])):
             if lo <= lvl <= hi:
-                fig.add_hline(y=lvl, line_color="rgba(150,150,150,0.35)", line_width=1,
+                B.add_hline(y=lvl, line_color="rgba(150,150,150,0.35)", line_width=1,
                               row=1, col=1)
 
     if show_sweeps and liq.ok and liq.sweeps:
@@ -457,11 +543,11 @@ def render_chart():
     if rows == 2:
         fig.add_trace(go.Scatter(x=x, y=fr["rsi"], name="RSI", mode="lines",
                                  line=dict(color="#8e44ad", width=1.2)), row=2, col=1)
-        fig.add_hrect(y0=45, y1=55, fillcolor="rgba(128,128,128,0.12)", line_width=0,
+        B.add_hrect(y0=45, y1=55, fillcolor="rgba(128,128,128,0.12)", line_width=0,
                       row=2, col=1)
         for lvl, clr in ((70, "#ef5350"), (60, "#e67e22"), (50, "#7f8c8d"),
                          (40, "#e67e22"), (30, "#26a69a")):
-            fig.add_hline(y=lvl, line_color=clr, line_width=1, line_dash="dot", row=2, col=1)
+            B.add_hline(y=lvl, line_color=clr, line_width=1, line_dash="dot", row=2, col=1)
         pb = (tech.cpr or {}).get("rsi_pullback") if tech.ok else None
         if pb and pb.get("bar_time") is not None and pb.get("rsi_at") is not None:
             col = {"CONFIRMED": "#27ae60", "CAUTION": "#e67e22",
@@ -484,6 +570,7 @@ def render_chart():
     breaks = _gap_breaks(x)
     if breaks:
         fig.update_xaxes(rangebreaks=[dict(values=breaks, dvalue=15 * 60 * 1000)])
+    B.flush()
     st.plotly_chart(fig, width="stretch")
     st.caption("Bands: blue = London, green = London–NY overlap, amber = New York. "
                "Shaded blue box = today's CPR. Triangles = liquidity sweeps (grey = "

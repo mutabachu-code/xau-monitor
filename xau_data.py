@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+import xau_bg as xb
 import xau_config as cfg
 import xau_sessions as xs
 
@@ -60,7 +61,6 @@ def _download(tickers: List[str], interval: str, period: str) -> pd.DataFrame:
                        progress=False, threads=True)
 
 
-@_cache
 def fetch_bundle(interval: str = cfg.SIGNAL_INTERVAL,
                  period: str = cfg.SIGNAL_PERIOD) -> Dict:
     """{'gold': df, 'primary': ticker, 'cross': {ticker: df}, 'errors': [...],
@@ -124,3 +124,51 @@ def bar_age_minutes(df: pd.DataFrame, now: datetime) -> Optional[float]:
     if df is None or df.empty:
         return None
     return (now - df.index[-1].to_pydatetime()).total_seconds() / 60
+
+
+# ── Background, incremental bundle ───────────────────────────────────────────
+def _merge_frame(old: pd.DataFrame, new: pd.DataFrame, keep_days: int) -> pd.DataFrame:
+    if new is None or new.empty:
+        return old
+    if old is None or old.empty:
+        out = new
+    else:
+        out = pd.concat([old, new])
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+    cutoff = out.index[-1] - pd.Timedelta(days=keep_days)
+    return out[out.index >= cutoff]
+
+
+def merge_bundle(old: Dict, new: Dict, keep_days: int = cfg.BUNDLE_KEEP_DAYS) -> Dict:
+    """Overlay a short recent download onto the cached history. Newer bars win
+    (the last, still-forming bar gets updated)."""
+    cross = dict(old.get("cross", {}))
+    for t, df in new.get("cross", {}).items():
+        cross[t] = _merge_frame(cross.get(t), df, keep_days)
+    return {"gold": _merge_frame(old["gold"], new["gold"], keep_days),
+            "primary": old["primary"], "cross": cross,
+            "errors": [e for e in new.get("errors", []) if "empty" not in e],
+            "fetched_at": new.get("fetched_at", datetime.now(timezone.utc)),
+            "full_at": old.get("full_at"), "mode": "incremental"}
+
+
+def _bundle_job() -> Dict:
+    import time as _t
+    prev = xb.peek("bundle")
+    full_due = prev is None or (_t.time() - (prev.get("full_at") or 0)) > cfg.BUNDLE_FULL_REFRESH_SEC
+    if not full_due:
+        inc = fetch_bundle(cfg.SIGNAL_INTERVAL, cfg.BUNDLE_INCR_PERIOD)
+        if not inc["gold"].empty and inc["primary"] == prev["primary"]:
+            return merge_bundle(prev, inc)
+    full = fetch_bundle(cfg.SIGNAL_INTERVAL, cfg.SIGNAL_PERIOD)
+    if full["gold"].empty:
+        raise RuntimeError("; ".join(full["errors"]) or "no gold data")
+    full["full_at"] = _t.time()
+    full["mode"] = "full"
+    return full
+
+
+def get_bundle(wait: float = cfg.BUNDLE_WAIT_FIRST) -> Optional[Dict]:
+    """Last good bundle immediately; refreshed in the background every
+    CACHE_TTL_SEC (incremental), with a full reload every 6 h."""
+    return xb.swr("bundle", _bundle_job, ttl=cfg.CACHE_TTL_SEC, neg_ttl=30, wait=wait)

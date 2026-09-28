@@ -100,11 +100,19 @@ def _spot_raw() -> Dict:
     raise RuntimeError("; ".join(errors) or "no spot source")
 
 
+_FAIL = {"t": 0.0}
+
+
 def fetch_spot(now: Optional[datetime] = None) -> Optional[Dict]:
-    """Latest spot quote with age / stale flags, or None."""
+    """Latest spot quote with age / stale flags, or None. After a failure the
+    feed is left alone for SPOT_NEG_TTL seconds so the 10 s ticker stays fast."""
+    import time as _t
+    if _t.time() - _FAIL["t"] < cfg.SPOT_NEG_TTL:
+        return None
     try:
         q = dict(_spot_raw())
     except Exception:  # noqa: BLE001 — failures are not cached
+        _FAIL["t"] = _t.time()
         return None
     now = now or datetime.now(timezone.utc)
     q["age_sec"] = max(0.0, (now - q["ts"]).total_seconds())

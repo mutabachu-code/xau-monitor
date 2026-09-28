@@ -118,7 +118,6 @@ def dynamic_weight(inv_short: Optional[float], inv_long: Optional[float]) -> Opt
 
 
 # ── FRED ─────────────────────────────────────────────────────────────────────
-@_fred_cache
 def _fred_raw(sid: str) -> pd.Series:
     url = cfg.FRED_CSV.format(sid=sid)
     req = urllib.request.Request(url, headers={"User-Agent": "xau-monitor/1.0"})
@@ -134,11 +133,10 @@ def _fred_raw(sid: str) -> pd.Series:
     return s
 
 
-def fetch_fred(sid: str) -> Optional[pd.Series]:
-    try:
-        return _fred_raw(sid)
-    except Exception:  # noqa: BLE001 — failure is not cached
-        return None
+def fetch_fred(sid: str, wait: float = cfg.BG_WAIT_FIRST) -> Optional[pd.Series]:
+    """Background-refreshed (6 h); failures back off BG_NEG_TTL seconds."""
+    import xau_bg as xb
+    return xb.swr(f"fred:{sid}", lambda: _fred_raw(sid), cfg.FRED_TTL_SEC, cfg.BG_NEG_TTL, wait)
 
 
 # ── Report ───────────────────────────────────────────────────────────────────

@@ -129,5 +129,5 @@ def get_rates_report(bundle: Dict, fred: Optional[Dict] = None) -> xm.MacroRepor
                               error=f"{type(e).__name__}: {e}")
 
 
-def load_fred() -> Dict[str, Optional[pd.Series]]:
-    return {sid: xm.fetch_fred(sid) for sid in (cfg.FRED_REAL_10Y, cfg.FRED_BREAKEVEN_10Y)}
+def load_fred(wait: float = cfg.BG_WAIT_FIRST) -> Dict[str, Optional[pd.Series]]:
+    return {sid: xm.fetch_fred(sid, wait) for sid in (cfg.FRED_REAL_10Y, cfg.FRED_BREAKEVEN_10Y)}

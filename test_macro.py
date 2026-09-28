@@ -103,6 +103,8 @@ def test_fred_parse_and_failure(monkeypatch):
         def __exit__(self, *a):
             return False
 
+    import xau_bg as xb
+    xb.reset()
     monkeypatch.setattr(xm.urllib.request, "urlopen", lambda *a, **k: Resp(csv))
     raw = getattr(xm._fred_raw, "__wrapped__", xm._fred_raw)
     monkeypatch.setattr(xm, "_fred_raw", raw)
@@ -113,6 +115,8 @@ def test_fred_parse_and_failure(monkeypatch):
         raise TimeoutError("blocked")
 
     monkeypatch.setattr(xm.urllib.request, "urlopen", boom)
+    assert xm.fetch_fred("DFII10") is not None       # last good value kept (stale-while-error)
+    xb.reset()
     assert xm.fetch_fred("DFII10") is None
 
 

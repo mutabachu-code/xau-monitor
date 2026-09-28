@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+import xau_bg as xb
 import xau_config as cfg
 import xau_data as xd
 import xau_macro as xm
@@ -38,7 +39,6 @@ except Exception:  # pragma: no cover
 
 
 # ── Fetchers ─────────────────────────────────────────────────────────────────
-@_opt_cache
 def _chain_raw(ticker: str = cfg.OPT_TICKER, max_expiries: int = 5) -> Dict:
     import yfinance as yf
     t = yf.Ticker(ticker)
@@ -56,14 +56,10 @@ def _chain_raw(ticker: str = cfg.OPT_TICKER, max_expiries: int = 5) -> Dict:
     return {"spot": spot, "expiries": out, "fetched": datetime.now(timezone.utc)}
 
 
-def fetch_chain() -> Optional[Dict]:
-    try:
-        return _chain_raw()
-    except Exception:  # noqa: BLE001
-        return None
+def fetch_chain(wait: float = cfg.BG_WAIT_FIRST) -> Optional[Dict]:
+    return xb.swr("gld_chain", _chain_raw, cfg.OPT_TTL_SEC, cfg.BG_NEG_TTL, wait)
 
 
-@_gvz_cache
 def _gvz_daily_raw() -> pd.DataFrame:
     df = xd.extract_ticker(xd._download(["^GVZ"], "1d", cfg.GVZ_DAILY_PERIOD), "^GVZ")
     if df.empty:
@@ -71,11 +67,13 @@ def _gvz_daily_raw() -> pd.DataFrame:
     return df
 
 
-def fetch_gvz_daily() -> Optional[pd.DataFrame]:
-    try:
-        return _gvz_daily_raw()
-    except Exception:  # noqa: BLE001
-        return None
+def fetch_gvz_daily(wait: float = cfg.BG_WAIT_FIRST) -> Optional[pd.DataFrame]:
+    return xb.swr("gvz_daily", _gvz_daily_raw, 3600, cfg.BG_NEG_TTL, wait)
+
+
+def prefetch() -> None:
+    fetch_chain(0)
+    fetch_gvz_daily(0)
 
 
 # ── Math ─────────────────────────────────────────────────────────────────────
