@@ -1205,9 +1205,15 @@ def render_entry_map():
                     delta_color="off")
         c[2].metric("Total dealer γ", "—" if gamma.total_gex is None else _fmt_gex(gamma.total_gex),
                     "per 1% move (GLD $)", delta_color="off")
+        _vol = "volume" in (getattr(gamma, "weight_mode", "") or "")
+        _w = "vol" if _vol else "OI"
+        if _vol:
+            st.warning("Yahoo is not returning GLD open interest right now — levels are "
+                       "weighted by today's options volume (a weaker proxy). Treat gamma "
+                       "strength as indicative only.")
         rows = [{"GC=F": f"{g['price']:,.2f}", "Spot": f"{g['price'] - basis:,.2f}",
                  "GLD strike": f"{g['strike']:.0f}", "Net γ": _fmt_gex(g["gex"]),
-                 "Call OI": f"{g['call_oi']:,.0f}", "Put OI": f"{g['put_oi']:,.0f}",
+                 f"Call {_w}": f"{g['call_oi']:,.0f}", f"Put {_w}": f"{g['put_oi']:,.0f}",
                  "IV": f"{g['iv'] * 100:.1f}%", "Call Δ": f"{g['delta']:.2f}",
                  "θ/day": f"${g['theta_day'] / 1000:,.0f}k", "DTE": f"{g['dte']:.1f}",
                  "Strength": f"{g['grade']} ({g['strength']:.2f})", "Role": g["role"]}
@@ -1216,7 +1222,10 @@ def render_entry_map():
         st.caption("Strength = share of the chain's dealer gamma, open interest and theta "
                    "at the strike, adjusted for IV (below-median IV = firmer), days to expiry "
                    "(≤2 days pins hardest) and moneyness (Δ≈0.5 = peak gamma). Positive net γ "
-                   "levels act as magnets / reversal points; negative ones let price run.")
+                   "levels act as magnets / reversal points; negative ones let price run. "
+                   f"Weighting: {getattr(gamma, 'weight_mode', '') or 'open interest'}"
+                   + ("" if getattr(gamma, "oi_coverage", None) is None else
+                      f" · OI reported on {gamma.oi_coverage:.0%} of strikes in range") + ".")
     if zones.ok:
         st.caption("Zones found — " + " · ".join(f"{tf}: {n}" for tf, n in zones.counts.items()) +
                    ". Chart shows the timeframes picked in the sidebar (support green, "

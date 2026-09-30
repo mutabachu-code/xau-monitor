@@ -268,3 +268,41 @@ def test_diffuse_chain_has_no_strong_levels():
     rep = xgm.get_gamma_report(chain(), 4300.0, NOW)            # uniform OI on every strike
     assert rep.ok and rep.levels
     assert all(l["grade"] != "STRONG" for l in rep.levels)
+
+
+# ── Yahoo sometimes blanks GLD open interest ────────────────────────────────
+def _zero_oi_chain(volume):
+    ch = chain(call_oi=lambda k: np.zeros(len(k)), put_oi=lambda k: np.zeros(len(k)))
+    for e in ch["expiries"]:
+        for s in ("calls", "puts"):
+            e[s] = e[s].copy()
+            e[s]["volume"] = volume(e[s]["strike"].to_numpy()) if callable(volume) else volume
+    return ch
+
+
+def test_gamma_suppressed_when_oi_and_volume_missing():
+    xgm._CACHE.clear()
+    rep = xgm.get_gamma_report(_zero_oi_chain(0.0), 4300.0, NOW)
+    assert not rep.ok and "suppressed" in rep.error and rep.levels == []
+    assert rep.regime in ("", None) or not rep.ok
+
+
+def test_gamma_volume_proxy_when_oi_missing():
+    xgm._CACHE.clear()
+    vol = lambda k: np.where(k == 410, 5000.0, np.where((k >= 395) & (k <= 405), 50.0, 0.0))
+    rep = xgm.get_gamma_report(_zero_oi_chain(vol), 4300.0, NOW)
+    assert rep.ok and "volume proxy" in rep.weight_mode
+    assert rep.oi_coverage == 0
+    assert any(round(l["strike"]) == 410 for l in rep.levels)
+    assert all(l["call_oi"] + l["put_oi"] > 0 for l in rep.levels)
+    assert any("volume" in n for n in rep.notes)
+
+
+def test_gamma_skips_empty_strikes_with_oi():
+    xgm._CACHE.clear()
+    ch = chain(call_oi=lambda k: np.where((k >= 395) & (k <= 410), 2000.0, 0.0),
+               put_oi=lambda k: np.where((k >= 390) & (k <= 405), 2000.0, 0.0))
+    rep = xgm.get_gamma_report(ch, 4300.0, NOW)
+    assert rep.ok and rep.weight_mode == "open interest"
+    assert all(390 <= l["strike"] <= 410 for l in rep.levels)
+    assert all(l["call_oi"] + l["put_oi"] > 0 for l in rep.levels)

@@ -486,6 +486,7 @@ GAMMA_RANGE_PCT = 8.0
 GAMMA_TOP_N = 6
 GAMMA_FLIP_GRID = 81                # price points scanned for the zero-gamma level
 GAMMA_SHARE_FULL = {"gex": 0.10, "oi": 0.08, "theta": 0.08}   # share of chain total = full marks
+GAMMA_MIN_WEIGHT = 500             # contracts (OI, else volume) needed in range to trust levels
 GAMMA_STRONG = 0.60
 GAMMA_MODERATE = 0.35
 
