@@ -29,8 +29,11 @@ import xau_config as cfg
 
 COLUMNS = ["id", "opened_utc", "bar_utc", "direction", "tier", "score", "entry", "sl",
            "tp1", "tp2", "risk", "rr1", "rr2", "regime", "status", "tp1_hit",
-           "closed_utc", "exit", "r_mult"]
+           "closed_utc", "exit", "r_mult", "order", "grade", "filled_utc", "entry_src"]
 OPEN = "open"
+PENDING = "pending"
+LIVE = (OPEN, PENDING)
+NOT_TRADES = ("cancelled", "missed", "replaced")     # never filled → excluded from stats
 
 
 def default_path() -> str:
@@ -55,9 +58,12 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
     df = df[COLUMNS].copy()
-    for c in ("opened_utc", "bar_utc", "closed_utc"):
+    for c in ("opened_utc", "bar_utc", "closed_utc", "filled_utc"):
         df[c] = pd.to_datetime(df[c], utc=True, errors="coerce")
     df["tp1_hit"] = df["tp1_hit"].astype(str).str.lower().isin(["true", "1", "1.0"])
+    df["order"] = df["order"].fillna("market").astype(str)
+    for c in ("grade", "entry_src"):
+        df[c] = df[c].astype(object)
     for c in ("score", "entry", "sl", "tp1", "tp2", "risk", "rr1", "rr2", "exit", "r_mult"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
@@ -88,29 +94,55 @@ def _r(direction: str, entry: float, price: float, risk: float) -> float:
 def _close(df, i, status, when, exit_px, r_mult):
     df.at[i, "status"] = status
     df.at[i, "closed_utc"] = when
-    df.at[i, "exit"] = round(float(exit_px), 2)
-    df.at[i, "r_mult"] = round(float(r_mult), 2)
+    df.at[i, "exit"] = np.nan if exit_px is None else round(float(exit_px), 2)
+    df.at[i, "r_mult"] = np.nan if r_mult is None else round(float(r_mult), 2)
 
 
 def update(df: pd.DataFrame, gold: pd.DataFrame) -> pd.DataFrame:
-    """Walk each open trade through the bars after its entry bar."""
+    """Replay every live order from its signal bar (deterministic each run).
+
+    Pending limit: fills when price trades through the entry within
+    PENDING_BARS; 'missed' if TP1 prints first; 'cancelled' on timeout.
+    On the fill bar only the stop is checked (conservative). Filled trades:
+    stop first if a bar touches both; half at TP1 with the stop to entry;
+    rest to TP2, back to entry, or market close after JOURNAL_EXPIRY_BARS."""
     if df.empty or gold is None or gold.empty:
         return df
     df = df.copy()
     part = cfg.JOURNAL_TP1_PART
-    for i in df.index[df["status"] == OPEN]:
+    for i in df.index[df["status"].isin(LIVE)]:
         t = df.loc[i]
         s = 1 if t["direction"] == "LONG" else -1
         bars = gold[gold.index > t["bar_utc"]]
-        tp1_hit = False                    # replay from entry every run: deterministic
+        filled = t["order"] != "limit"
+        df.at[i, "status"] = OPEN if filled else PENDING
         df.at[i, "tp1_hit"] = False
+        if not filled:
+            df.at[i, "filled_utc"] = pd.NaT
+        tp1_hit, since_fill = False, 0
         for n, (ts, b) in enumerate(bars.iterrows(), start=1):
             hi, lo = float(b["High"]), float(b["Low"])
             adverse = lo if s > 0 else hi
             favour = hi if s > 0 else lo
+            if not filled:
+                if n > cfg.PENDING_BARS:
+                    _close(df, i, "cancelled", ts, None, None)
+                    break
+                if (adverse <= t["entry"]) if s > 0 else (adverse >= t["entry"]):
+                    filled = True
+                    df.at[i, "status"] = OPEN
+                    df.at[i, "filled_utc"] = ts
+                    if (adverse <= t["sl"]) if s > 0 else (adverse >= t["sl"]):
+                        _close(df, i, "sl", ts, t["sl"], -1.0)
+                        break
+                    continue
+                if (favour >= t["tp1"]) if s > 0 else (favour <= t["tp1"]):
+                    _close(df, i, "missed", ts, None, None)
+                    break
+                continue
+            since_fill += 1
             stop = t["entry"] if tp1_hit else t["sl"]
-            hit_stop = (adverse <= stop) if s > 0 else (adverse >= stop)
-            if hit_stop:                                   # stop first (conservative)
+            if (adverse <= stop) if s > 0 else (adverse >= stop):   # stop first
                 if tp1_hit:
                     _close(df, i, "tp1+be", ts, stop, part * t["rr1"])
                 else:
@@ -122,7 +154,7 @@ def update(df: pd.DataFrame, gold: pd.DataFrame) -> pd.DataFrame:
             if tp1_hit and ((favour >= t["tp2"]) if s > 0 else (favour <= t["tp2"])):
                 _close(df, i, "tp2", ts, t["tp2"], part * t["rr1"] + (1 - part) * t["rr2"])
                 break
-            if n >= cfg.JOURNAL_EXPIRY_BARS:
+            if since_fill >= cfg.JOURNAL_EXPIRY_BARS:
                 px = float(b["Close"])
                 rr = _r(t["direction"], t["entry"], px, t["risk"])
                 r = part * t["rr1"] + (1 - part) * rr if tp1_hit else rr
@@ -133,53 +165,76 @@ def update(df: pd.DataFrame, gold: pd.DataFrame) -> pd.DataFrame:
 
 def maybe_open(df: pd.DataFrame, sig, gold: pd.DataFrame, regime: str = "",
                now: Optional[datetime] = None) -> pd.DataFrame:
-    """Record the master signal if it is actionable and new for this bar."""
+    """Record the master signal if it is actionable and new.
+
+    Limit plans become pending orders. A pending order in the same direction is
+    replaced only if the new entry is > 0.5R away; opposite signals reverse open
+    trades and cancel opposite pending orders."""
     if sig is None or not getattr(sig, "ok", False) or sig.action not in ("LONG", "SHORT") \
             or not sig.plan or gold is None or gold.empty:
+        return df
+    p = sig.plan
+    if p.get("entry_type") == "none":
         return df
     df = df.copy()
     bar = gold.index[-1]
     now = now or datetime.now(timezone.utc)
-    opens = df[df["status"] == OPEN]
-    if ((opens["direction"] == sig.action)).any():
+    price = float(gold["Close"].iat[-1])
+    same = df[(df["status"].isin(LIVE)) & (df["direction"] == sig.action)]
+    if ((same["status"] == OPEN)).any():
         return df                                           # already in this direction
     if ((df["bar_utc"] == bar) & (df["direction"] == sig.action)).any():
         return df                                           # already logged this bar
-    price = float(gold["Close"].iat[-1])
-    for i in opens.index:                                   # opposite trade → reverse
+    for i in same.index:                                    # pending, same direction
+        if abs(df.at[i, "entry"] - p["entry"]) <= 0.5 * df.at[i, "risk"]:
+            return df
+        _close(df, i, "replaced", bar, None, None)
+    part = cfg.JOURNAL_TP1_PART
+    for i in df.index[(df["status"].isin(LIVE)) & (df["direction"] != sig.action)]:
         t = df.loc[i]
+        if t["status"] == PENDING:
+            _close(df, i, "cancelled", bar, None, None)
+            continue
         rr = _r(t["direction"], t["entry"], price, t["risk"])
-        part = cfg.JOURNAL_TP1_PART
         r = part * t["rr1"] + (1 - part) * rr if bool(t["tp1_hit"]) else rr
         _close(df, i, "reversed", bar, price, r)
-    p = sig.plan
+    s = 1 if sig.action == "LONG" else -1
+    is_limit = p.get("entry_type") in ("limit", "chase") and s * (price - p["entry"]) > 1e-9
     row = {"id": f"{bar:%Y%m%d%H%M}-{sig.action[0]}", "opened_utc": now, "bar_utc": bar,
            "direction": sig.action, "tier": sig.tier, "score": sig.score,
            "entry": p["entry"], "sl": p["sl"], "tp1": p["tp1"], "tp2": p["tp2"],
            "risk": p["risk"], "rr1": p["rr1"], "rr2": p["rr2"], "regime": regime,
-           "status": OPEN, "tp1_hit": False, "closed_utc": pd.NaT, "exit": np.nan,
-           "r_mult": np.nan}
+           "status": PENDING if is_limit else OPEN, "tp1_hit": False,
+           "closed_utc": pd.NaT, "exit": np.nan, "r_mult": np.nan,
+           "order": "limit" if is_limit else "market", "grade": p.get("grade", ""),
+           "filled_utc": pd.NaT if is_limit else bar, "entry_src": p.get("entry_src", "")}
     new = pd.DataFrame([row])
     return normalize(new if df.empty else pd.concat([df, new], ignore_index=True))
 
 
 def stats(df: pd.DataFrame, now: Optional[datetime] = None) -> Dict:
     now = now or datetime.now(timezone.utc)
-    closed = df[df["status"] != OPEN]
+    closed = df[~df["status"].isin(LIVE + NOT_TRADES)]
     n = len(closed)
     wins = int(closed["tp1_hit"].sum()) if n else 0
     first = df["opened_utc"].min() if len(df) else None
     days = 0 if first is None or pd.isna(first) else max(0, (now - first.to_pydatetime()).days)
-    by_tier = {}
-    for t, g in closed.groupby("tier"):
-        by_tier[t] = {"n": len(g), "win_rate": float(g["tp1_hit"].mean()),
+    by_tier, by_grade = {}, {}
+    for key, out in (("tier", by_tier), ("grade", by_grade)):
+        for t, g in closed.groupby(key):
+            out[t] = {"n": len(g), "win_rate": float(g["tp1_hit"].mean()),
                       "net_r": float(g["r_mult"].sum())}
-    return {"closed": n, "open": int((df["status"] == OPEN).sum()), "wins": wins,
-            "win_rate": wins / n if n else None,
+    limits = df[df["order"] == "limit"]
+    resolved = limits[~limits["status"].isin(LIVE)]
+    fill_rate = float((~resolved["status"].isin(NOT_TRADES)).mean()) if len(resolved) else None
+    return {"closed": n, "open": int((df["status"] == OPEN).sum()),
+            "pending": int((df["status"] == PENDING).sum()),
+            "unfilled": int(df["status"].isin(NOT_TRADES).sum()), "fill_rate": fill_rate,
+            "wins": wins, "win_rate": wins / n if n else None,
             "net_r": float(closed["r_mult"].sum()) if n else 0.0,
             "avg_r": float(closed["r_mult"].mean()) if n else None,
             "days": days, "days_target": cfg.FORWARD_TEST_DAYS,
-            "target": cfg.WIN_RATE_TARGET, "by_tier": by_tier,
+            "target": cfg.WIN_RATE_TARGET, "by_tier": by_tier, "by_grade": by_grade,
             "on_track": bool(n >= 20 and wins / n >= cfg.WIN_RATE_TARGET)}
 
 

@@ -32,7 +32,8 @@ _REQUIRED_FILES = ["xau_config.py", "xau_sessions.py", "xau_data.py", "xau_techn
                    "xau_liquidity.py", "xau_macro.py", "xau_rates.py", "xau_dollar.py",
                    "xau_crossasset.py", "xau_regime.py", "xau_runtime.py",
                    "xau_flows.py", "xau_options.py", "xau_calendar.py",
-                   "xau_master_signal.py", "xau_journal.py", "xau_spot.py", "xau_bg.py"]
+                   "xau_master_signal.py", "xau_journal.py", "xau_spot.py", "xau_bg.py",
+                   "xau_zones.py", "xau_gamma.py", "xau_entry.py"]
 _missing = [f for f in _REQUIRED_FILES if not _os.path.exists(_os.path.join(_APP_DIR, f))]
 if _missing:
     st.error("**Missing from the repo:** " + ", ".join(f"`{f}`" for f in _missing) +
@@ -46,7 +47,9 @@ import xau_config as cfg
 import xau_crossasset as xc
 import xau_data as xd
 import xau_dollar as xdl
+import xau_entry as xe
 import xau_flows as xf
+import xau_gamma as xgm
 import xau_options as xo
 import xau_journal as xj
 import xau_liquidity as xl
@@ -56,14 +59,15 @@ import xau_regime as xg
 import xau_sessions as xs
 import xau_spot as xsp
 import xau_technicals as xt
+import xau_zones as xz
 import xau_macro as xm
 import xau_runtime as xrt
 
 # Reload project modules if a git push changed them (Streamlit Cloud can keep
 # stale copies in memory), dependency order: config first, app-level last.
 _reloaded = xrt.ensure_fresh([cfg, xs, xd, xt, xl, xm, xr, xdl, xc, xg, xf, xo, xk,
-                              xms, xj, xsp])
-REQUIRED_CONFIG_VERSION = 9
+                              xz, xgm, xe, xms, xj, xsp])
+REQUIRED_CONFIG_VERSION = 10
 if getattr(cfg, "CONFIG_VERSION", 0) < REQUIRED_CONFIG_VERSION:
     st.error(f"xau_config.py on the server is older than app.py expects "
              f"(version {getattr(cfg, 'CONFIG_VERSION', 'none')} < "
@@ -110,6 +114,9 @@ with st.sidebar:
     show_walls = st.checkbox("Option walls (GLD → GC=F)", value=True)
     show_events = st.checkbox("Economic events", value=True)
     show_plan = st.checkbox("Trade plan (entry / SL / TP)", value=True)
+    show_zones = st.checkbox("S/D · order block · FVG zones", value=True)
+    zone_tfs = st.multiselect("Zone timeframes", list(cfg.ZONE_TFS), default=["1h", "4h"])
+    show_gamma = st.checkbox("Gamma levels (greeks)", value=True)
     if st.button("Refresh data"):
         st.cache_data.clear()
         xb.reset()
@@ -153,7 +160,11 @@ opts = xo.get_options_report(gold, bundle["cross"].get("^GVZ"))
 gate = xk.get_gate_report(now, em_exhausted=bool(opts.flags.get("em_exhausted")))
 LAYERS = {"L1": rates, "L2": dollar, "L3": xasset, "L4": flows,
           "L5": tech, "L6": liq, "L7": opts, "L8": regime}
-signal = xms.get_master_signal(LAYERS, gold, gate, basis, now)
+zones = xz.get_zone_report(gold)
+gamma = xgm.get_gamma_report(xo.fetch_chain(wait=0),
+                             float(gold["Close"].iat[-1]) if not gold.empty else 0.0, now)
+signal = xms.get_master_signal(LAYERS, gold, gate, basis, now,
+                               entry_ctx={"zones": zones, "gamma": gamma})
 if "journal_df" not in st.session_state:
     st.session_state["journal_df"] = None
 _jdf, _jsaved, _jerr = xj.step(signal, gold, regime.regime if regime.ok else "",
@@ -495,6 +506,34 @@ def render_chart():
     if pdl:
         seg(pdl["high"], "PDH", "#e67e22", "dash")
         seg(pdl["low"], "PDL", "#e67e22", "dash")
+    lo_v, hi_v = float(df["Low"].min()), float(df["High"].max())
+    pad_v = (hi_v - lo_v) * 0.25
+    if show_zones and zones.ok:
+        vis = [z for z in zones.zones if z["tf"] in zone_tfs
+               and z["hi"] >= lo_v - pad_v and z["lo"] <= hi_v + pad_v]
+        for z in sorted(vis, key=lambda z: -z["weight"])[:14]:
+            sup = z["side"] == "support"
+            rgb = "38,166,154" if sup else "239,83,80"
+            alpha = {"15m": 0.07, "1h": 0.11, "4h": 0.16}.get(z["tf"], 0.1)
+            x0z = max(_local(z["created"]), x[0])
+            B.add_shape(type="rect", x0=x0z, x1=x_end, y0=z["lo"], y1=z["hi"],
+                        fillcolor=f"rgba({rgb},{alpha})", layer="below",
+                        line=dict(color=f"rgba({rgb},0.55)", width=0.8,
+                                  dash="dot" if z["kind"] in ("fvg", "ifvg") else "solid"),
+                        row=1, col=1)
+            B.add_annotation(x=x0z, y=z["hi"] if sup else z["lo"], showarrow=False,
+                             text=z["label"] + ("" if z["fresh"] else f" ×{z['touches']}"),
+                             xanchor="left", yanchor="top" if sup else "bottom",
+                             font=dict(size=9, color=f"rgb({rgb})"), row=1, col=1)
+    if show_gamma and gamma.ok:
+        for gl in gamma.levels:
+            if lo_v - pad_v <= gl["price"] <= hi_v + pad_v:
+                seg(gl["price"], f"γ{'+' if gl['gex'] > 0 else '−'} {gl['grade']} "
+                    f"{gl['strike']:.0f}", "#8e44ad",
+                    "dot" if gl["grade"] == "WEAK" else "dashdot",
+                    1.8 if gl["grade"] == "STRONG" else 1)
+        if gamma.flip and lo_v - pad_v <= gamma.flip <= hi_v + pad_v:
+            seg(gamma.flip, "γ flip", "#8e44ad", "longdash", 1.2)
     if show_plan and signal.ok and signal.plan:
         pl = signal.plan
         live = signal.action in ("LONG", "SHORT")
@@ -982,14 +1021,27 @@ def render_signal():
     left, right = st.columns([1, 1])
     with left:
         p = signal.plan
-        if p:
+        if p and p.get("entry_type") == "none":
+            st.markdown(f"**No entry location — {p['direction']} bias, waiting for a level**")
+            st.info(p["reason"])
+        elif p:
+            et = p.get("entry_type", "market")
+            badge = {"limit": "🎯 LIMIT at zone", "chase": "🏃 MOMENTUM CHASE",
+                     "market": "⚡ MARKET"}.get(et, et.upper())
             hdr = "Trade plan" if signal.action != "WAIT" else \
                 "Hypothetical plan (not actionable now)"
-            st.markdown(f"**{hdr} — {p['direction']}**")
+            st.markdown(f"**{hdr} — {p['direction']} · {badge}**" +
+                        (f" · grade **{p['grade']}** ({p['strength']})" if p.get("grade") else ""))
+            zl, zh = p["zone"]
+            dist = p.get("distance_atr")
             rows = [
-                {"Level": "Entry zone", "GC=F": f"{p['zone'][0]:,.2f} – {p['zone'][1]:,.2f}",
-                 "XAUUSD spot": f"{p['zone'][0] - p['basis']:,.2f} – {p['zone'][1] - p['basis']:,.2f}",
-                 "Basis of level": f"last {p['entry']:,.2f}"},
+                {"Level": "Entry", "GC=F": f"{p['entry']:,.2f}",
+                 "XAUUSD spot": f"{p['spot']['entry']:,.2f}",
+                 "Basis of level": (p.get("entry_src") or f"last {p['entry']:,.2f}") +
+                 ("" if dist is None or et == "market" else f" · {abs(dist):.1f} ATR away")},
+                {"Level": "Zone", "GC=F": f"{zl:,.2f} – {zh:,.2f}",
+                 "XAUUSD spot": f"{zl - p['basis']:,.2f} – {zh - p['basis']:,.2f}",
+                 "Basis of level": ", ".join(p.get("confluence", [])[:4]) or "entry band"},
                 {"Level": "Stop", "GC=F": f"{p['sl']:,.2f}", "XAUUSD spot": f"{p['spot']['sl']:,.2f}",
                  "Basis of level": f"{p['stop_src']} · risk ${p['risk']:,.2f} "
                                    f"({p['risk'] / p['atr']:.1f} ATR)"},
@@ -1001,8 +1053,11 @@ def render_signal():
                  else f"{p['tp2_src']} · {p['rr2']:.1f}R"},
             ]
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-            st.caption(f"Take {cfg.JOURNAL_TP1_PART:.0%} at TP1 and move the stop to entry. "
-                       f"Spot = GC=F − basis {p['basis']:+.2f} ({basis_src}).")
+            tip = ("Place a limit order at the entry; the journal counts it only if it fills "
+                   f"within {cfg.PENDING_BARS // 4} h. ") if et in ("limit", "chase") and dist \
+                and abs(dist) > 0.05 else ""
+            st.caption(tip + f"Take {cfg.JOURNAL_TP1_PART:.0%} at TP1 and move the stop to "
+                       f"entry. Spot = GC=F − basis {p['basis']:+.2f} ({basis_src}).")
         else:
             st.caption("No directional plan — score below the C-tier threshold "
                        f"(|score| < {cfg.TIERS[-1][0]}).")
@@ -1051,7 +1106,8 @@ def render_journal():
         df = xj.empty()
     s_ = xj.stats(df, now)
     c = st.columns(5)
-    c[0].metric("Closed trades", s_["closed"], f"{s_['open']} open", delta_color="off")
+    c[0].metric("Closed trades", s_["closed"],
+                f"{s_['open']} open · {s_['pending']} pending", delta_color="off")
     c[1].metric("Win rate (TP1 hit)", "—" if s_["win_rate"] is None else f"{s_['win_rate']:.0%}",
                 f"target {s_['target']:.0%}", delta_color="off")
     c[2].metric("Net R", f"{s_['net_r']:+.2f}",
@@ -1059,11 +1115,18 @@ def render_journal():
     c[3].metric("Test days", f"{s_['days']} / {s_['days_target']}")
     c[4].metric("MT5 gate", "ready" if s_["on_track"] and s_["days"] >= s_["days_target"]
                 else "not yet", "needs ≥20 trades, ≥75%, 60 days", delta_color="off")
+    if s_["fill_rate"] is not None or s_["unfilled"]:
+        fr = "—" if s_["fill_rate"] is None else f"{s_['fill_rate']:.0%}"
+        by_g = ", ".join(f"{g} {v['win_rate']:.0%} of {v['n']}"
+                         for g, v in sorted(s_["by_grade"].items()))
+        st.caption(f"Limit orders: fill rate {fr} · {s_['unfilled']} never filled (missed / "
+                   "cancelled / replaced — not counted in the win rate)."
+                   + (f" By entry grade: {by_g}." if by_g else ""))
     if len(df):
         show = df.sort_values("bar_utc", ascending=False).head(25).copy()
         show["bar (EAT)"] = show["bar_utc"].dt.tz_convert(cfg.DISPLAY_TZ).dt.strftime("%a %d %b %H:%M")
-        st.dataframe(show[["bar (EAT)", "direction", "tier", "score", "entry", "sl", "tp1",
-                           "tp2", "status", "r_mult", "regime"]],
+        st.dataframe(show[["bar (EAT)", "direction", "tier", "grade", "order", "entry", "sl",
+                           "tp1", "tp2", "status", "r_mult", "entry_src"]],
                      hide_index=True, width="stretch")
     else:
         st.caption("No signals logged yet. A trade is logged the first time the master "
@@ -1085,6 +1148,79 @@ def render_journal():
     st.caption("The journal only advances while the dashboard is open, and Streamlit Cloud "
                "wipes files on reboot or redeploy — download it regularly and restore after "
                "a push." + note + (f" ({_jerr})" if _jerr else ""))
+
+
+# ── Entry map: zones, liquidity, gamma, momentum ────────────────────────────
+TICK = {True: "✅", False: "✗"}
+
+
+def _fmt_gex(v):
+    return f"{v / 1e6:+,.1f}m"
+
+
+def render_entry_map():
+    st.subheader("Entry map — zones · liquidity · gamma · momentum")
+    if gold.empty or not tech.ok:
+        st.info("Needs price data.")
+        return
+    plans = {d: xe.get_entry_plan(d, gold, tech, liq, zones, gamma, opts, basis)
+             for d in ("LONG", "SHORT")}
+    cols = st.columns(2)
+    for col, d in zip(cols, ("LONG", "SHORT")):
+        ep = plans[d]
+        with col:
+            live = signal.ok and signal.direction == d
+            st.markdown(f"**Best {d.lower()} location**" + (" · ← signal direction" if live else ""))
+            if not ep.ok or not ep.plan:
+                st.caption(ep.error or "—")
+                continue
+            p, m = ep.plan, ep.momentum
+            st.caption(f"Momentum {m['grade']} ({m['score']}/{m['of']}): " +
+                       " ".join(f"{TICK[v]} {k}" for k, v in m["checks"].items()))
+            if p["entry_type"] == "none":
+                st.caption("No confluence zone within 3 ATR — " + p["reason"].split(" — ")[-1])
+            else:
+                st.markdown(f"{ {'limit': '🎯 Limit', 'chase': '🏃 Chase', 'market': '⚡ Market'}[p['entry_type']] } "
+                            f"**{p['entry']:,.2f}** (spot {p['spot']['entry']:,.2f}) · SL {p['sl']:,.2f} · "
+                            f"TP1 {p['tp1']:,.2f} · TP2 {p['tp2']:,.2f} · grade **{p['grade']}**")
+                st.caption(" + ".join(p["confluence"][:5]))
+            rows = [{"Location (GC=F)": f"{c['lo']:,.2f}–{c['hi']:,.2f}",
+                     "Spot": f"{c['lo'] - basis:,.2f}–{c['hi'] - basis:,.2f}",
+                     "Away": f"{c['dist_atr']:.1f} ATR", "Score": c["adj"],
+                     "Confluence": ", ".join(c["labels"][:4])} for c in ep.clusters[:5]]
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    st.markdown("**Dealer gamma levels (GLD options → GC=F)**")
+    if not gamma.ok:
+        st.caption(f"Gamma unavailable: {gamma.error}")
+    else:
+        c = st.columns(3)
+        c[0].metric("Gamma regime", gamma.regime.capitalize(),
+                    "fades moves → zones" if gamma.regime == "positive" else
+                    "chases moves → momentum" if gamma.regime == "negative" else None,
+                    delta_color="off")
+        c[1].metric("Gamma flip", "—" if gamma.flip is None else f"{gamma.flip:,.2f}",
+                    None if gamma.flip is None else f"spot {gamma.flip - basis:,.2f}",
+                    delta_color="off")
+        c[2].metric("Total dealer γ", "—" if gamma.total_gex is None else _fmt_gex(gamma.total_gex),
+                    "per 1% move (GLD $)", delta_color="off")
+        rows = [{"GC=F": f"{g['price']:,.2f}", "Spot": f"{g['price'] - basis:,.2f}",
+                 "GLD strike": f"{g['strike']:.0f}", "Net γ": _fmt_gex(g["gex"]),
+                 "Call OI": f"{g['call_oi']:,.0f}", "Put OI": f"{g['put_oi']:,.0f}",
+                 "IV": f"{g['iv'] * 100:.1f}%", "Call Δ": f"{g['delta']:.2f}",
+                 "θ/day": f"${g['theta_day'] / 1000:,.0f}k", "DTE": f"{g['dte']:.1f}",
+                 "Strength": f"{g['grade']} ({g['strength']:.2f})", "Role": g["role"]}
+                for g in sorted(gamma.levels, key=lambda g: -g["price"])]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption("Strength = share of the chain's dealer gamma, open interest and theta "
+                   "at the strike, adjusted for IV (below-median IV = firmer), days to expiry "
+                   "(≤2 days pins hardest) and moneyness (Δ≈0.5 = peak gamma). Positive net γ "
+                   "levels act as magnets / reversal points; negative ones let price run.")
+    if zones.ok:
+        st.caption("Zones found — " + " · ".join(f"{tf}: {n}" for tf, n in zones.counts.items()) +
+                   ". Chart shows the timeframes picked in the sidebar (support green, "
+                   "resistance red; dotted = FVG/IFVG; ×n = times tested).")
 
 
 # ── Layer panels ─────────────────────────────────────────────────────────────
@@ -1227,6 +1363,9 @@ with left:
     panel("Chart", render_chart)
 with right:
     panel("Session clock", render_clock)
+
+st.divider()
+panel("Entry map", render_entry_map)
 
 st.divider()
 mcol1, mcol2 = st.columns(2)

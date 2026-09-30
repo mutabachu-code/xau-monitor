@@ -13,7 +13,7 @@ Decisions (2026-09-26):
 from dataclasses import dataclass
 
 # Bumped whenever a phase adds settings; app.py refuses to run on an older copy.
-CONFIG_VERSION = 9
+CONFIG_VERSION = 10
 from datetime import time
 from typing import Optional, Tuple
 
@@ -461,3 +461,55 @@ BUNDLE_WAIT_FIRST = 45            # first page load waits at most this long for 
 BG_NEG_TTL = 300                  # failed source: don't retry for 5 min
 BG_WAIT_FIRST = 8                 # other sources: first load waits at most this long
 SPOT_NEG_TTL = 60                 # spot feed unreachable: back off 60 s
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Entry engine — MTF zones, FVG/IFVG, order blocks, gamma levels, confluence
+# ═════════════════════════════════════════════════════════════════════════════
+ZONE_TFS = {"15m": {"rule": None, "bars": 400, "weight": 1.0},
+            "1h": {"rule": "1h", "bars": 300, "weight": 2.0},
+            "4h": {"rule": "4h", "bars": 180, "weight": 3.0}}
+ZONE_4H_OFFSET = "2h"               # 4h bins at 22/02/06/10/14/18 UTC ≈ CME day start
+DISP_ATR = 1.5                      # displacement: move ≥ 1.5 ATR within DISP_BARS
+DISP_BARS = 3
+BASE_MAX_ATR = 1.0                  # base candle range ≤ this × ATR
+FVG_MIN_ATR = 0.10                  # minimum gap size
+ZONE_MAX_HEIGHT_ATR = 2.0           # taller zones are trimmed to the proximal part
+KIND_WEIGHT = {"ob": 1.2, "sd": 1.0, "fvg": 0.8, "ifvg": 0.9, "liq": 1.0,
+               "gamma": 1.0, "vwap": 0.5, "cpr": 0.5, "wall": 1.0}
+FRESH_BONUS = 1.2
+TESTED_PENALTY = 0.7                # 2+ tests
+
+# Gamma levels (GLD chain → GC=F)
+GAMMA_EXPIRIES = 3
+GAMMA_RANGE_PCT = 8.0
+GAMMA_TOP_N = 6
+GAMMA_FLIP_GRID = 81                # price points scanned for the zero-gamma level
+GAMMA_SHARE_FULL = {"gex": 0.10, "oi": 0.08, "theta": 0.08}   # share of chain total = full marks
+GAMMA_STRONG = 0.60
+GAMMA_MODERATE = 0.35
+
+# Confluence & entry
+ENTRY_MAX_DIST_ATR = 3.0            # look for entry zones within 3 × 15m ATR
+CLUSTER_GAP_ATR = 0.25              # zones closer than this merge into one cluster
+CLUSTER_MIN_SCORE = 2.0
+ENTRY_DEPTH = 0.25                  # enter 25% into the cluster from its proximal edge
+STOP_BEYOND_ATR = 0.25              # stop buffer beyond the cluster's distal edge
+LIQ_STOP_GUARD_ATR = 0.5            # pool within this beyond the stop → stop goes past it
+ENTRY_RISK_MIN_ATR = 0.6
+ENTRY_RISK_MAX_ATR = 3.0
+TP1_MIN_R, TP2_MIN_R, TP2_DEFAULT_R = 1.0, 2.0, 2.5
+OBSTACLE_MIN_R = 1.0                # opposing zone closer than this = poor RR
+
+# Momentum / chase
+MOM_DISP_ATR = 1.2                  # last 3 bars moved ≥ 1.2 ATR in the direction
+MOM_RVOL = 1.3
+MOM_ADX = 25
+MOM_STRONG, MOM_MODERATE = 4, 3     # of 6 checks
+CHASE_FVG_BARS = 6                  # fresh FVG created within this many bars
+CHASE_MAX_DIST_ATR = 1.0            # chase only if the best zone is further than this
+CHASE_FVG_MAX_ATR = 2.0             # fresh FVG retest used if within this of price
+CHASE_SIZE = 0.5
+
+# Journal pending orders
+PENDING_BARS = 16                   # limit order lives 4h, then cancelled

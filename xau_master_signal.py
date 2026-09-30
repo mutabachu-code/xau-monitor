@@ -64,6 +64,7 @@ class MasterSignal:
     rules: List[Dict] = field(default_factory=list)
     blocked_by: List[str] = field(default_factory=list)
     plan: Optional[Dict] = None
+    entry: Optional[object] = None      # xau_entry.EntryPlan (clusters, momentum)
     notes: List[str] = field(default_factory=list)
 
 
@@ -142,7 +143,7 @@ def build_plan(direction: str, gold: pd.DataFrame, tech, liq, opts, basis: float
 
 # ── Master ───────────────────────────────────────────────────────────────────
 def compute(layers: Dict, gold: pd.DataFrame, gate=None, basis: float = 0.0,
-            now=None) -> MasterSignal:
+            now=None, entry_ctx: Optional[Dict] = None) -> MasterSignal:
     """layers: {"L1": rates, "L2": dollar, "L3": xasset, "L4": flows,
                 "L5": tech, "L6": liq, "L7": opts, "L8": regime}"""
     sig = MasterSignal()
@@ -287,6 +288,33 @@ def compute(layers: Dict, gold: pd.DataFrame, gate=None, basis: float = 0.0,
         size *= cfg.ATR_SIZE[tech.atr_regime]
         sig.notes.append(f"ATR {tech.atr_regime} — size ×{cfg.ATR_SIZE[tech.atr_regime]}")
 
+    # entry location: confluence engine when available, legacy plan as fallback
+    sig.plan = None
+    if D != "NEUTRAL":
+        ep = None
+        if entry_ctx is not None:
+            import xau_entry as xe
+            ep = xe.get_entry_plan(D, gold, tech, liq, entry_ctx.get("zones"),
+                                   entry_ctx.get("gamma"), opts, basis)
+            sig.entry = ep
+        if ep is not None and ep.ok and ep.plan:
+            sig.plan = ep.plan
+            sig.notes.extend(ep.notes)
+            if ep.plan["entry_type"] == "none":
+                block.append("ZONE")
+                rule("Z1", "No entry location", "wait", ep.plan["reason"])
+            else:
+                size *= ep.plan["size_factor"]
+                if ep.plan["grade"] == "C":
+                    rule("Z2", "Weak entry location", "size ×0.5",
+                         f"grade C at {ep.plan['entry_src']}")
+        else:
+            sig.plan = build_plan(D, gold, tech, liq, opts, basis)
+            if sig.plan:
+                sig.plan["entry_type"] = "market"
+            if ep is not None and ep.error:
+                sig.notes.append(f"Entry engine unavailable ({ep.error}) — market plan used")
+
     sig.blocked_by = block
     if D != "NEUTRAL" and tier > 0 and not block:
         sig.action = D
@@ -294,7 +322,6 @@ def compute(layers: Dict, gold: pd.DataFrame, gate=None, basis: float = 0.0,
     else:
         sig.action = "WAIT"
         sig.size_mult = 0.0
-    sig.plan = build_plan(D, gold, tech, liq, opts, basis) if D != "NEUTRAL" else None
     if sig.plan and _ok(opts) and opts.em_daily and _ok(tech):
         sig.plan["em_daily"] = round(opts.em_daily, 2)
     sig.ok = True
@@ -302,8 +329,8 @@ def compute(layers: Dict, gold: pd.DataFrame, gate=None, basis: float = 0.0,
 
 
 def get_master_signal(layers: Dict, gold: pd.DataFrame, gate=None, basis: float = 0.0,
-                      now=None) -> MasterSignal:
+                      now=None, entry_ctx: Optional[Dict] = None) -> MasterSignal:
     try:
-        return compute(layers, gold, gate, basis, now)
+        return compute(layers, gold, gate, basis, now, entry_ctx)
     except Exception as e:  # noqa: BLE001
         return MasterSignal(error=f"{type(e).__name__}: {e}")
